@@ -34,8 +34,20 @@ if [ ! -f "$staging/.extracted" ]; then
     require_cmd tar
     rm -rf "$staging"
     mkdir -p "$staging"
-    # The cloud rootfs tarball has no top-level directory.
-    tar -xJf "$tarball" -C "$staging"
+    # The cloud rootfs tarball has no top-level directory and ships /dev/*
+    # device nodes; creating them (mknod) needs privileges a plain CI runner
+    # user lacks, so fall back to sudo and hand the tree back afterwards.
+    tar_err="$BUILD_DIR/base/$TARGET_ARCH/tar.err"
+    if ! tar -xJf "$tarball" -C "$staging" 2>"$tar_err"; then
+        if grep -q "Cannot mknod" "$tar_err" && command -v sudo >/dev/null 2>&1; then
+            log "device nodes need mknod privileges; retrying with sudo"
+            sudo tar -xJf "$tarball" -C "$staging"
+            sudo chown -R "$(id -u):$(id -g)" "$staging"
+        else
+            cat "$tar_err" >&2
+            die "tar extraction failed: $tarball_name"
+        fi
+    fi
     touch "$staging/.extracted"
     log "extracted $tarball_name -> $staging"
 fi
