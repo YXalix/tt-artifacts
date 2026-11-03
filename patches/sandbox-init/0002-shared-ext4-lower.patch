@@ -1,0 +1,105 @@
+--- a/cmd/sandbox-init/main.go
++++ b/cmd/sandbox-init/main.go
+@@ -279,8 +279,8 @@
+ 		}
+ 		logf("phase1a: vda+vdb present")
+ 
+-		if err := unix.Mount("/dev/vda", "/overlay/lower", "erofs", unix.MS_RDONLY, ""); err != nil {
+-			return fmt.Errorf("mount blk0 (erofs ro) on /overlay/lower: %w", err)
++		if err := mountReadonlyLower("/dev/vda", "/overlay/lower"); err != nil {
++			return fmt.Errorf("mount blk0 readonly lower on /overlay/lower: %w", err)
+ 		}
+ 		if err := unix.Mount("/dev/vdb", "/overlay/upper", "ext4", 0, ""); err != nil {
+ 			return fmt.Errorf("mount blk1 (ext4 rw) on /overlay/upper: %w", err)
+--- /dev/null
++++ b/cmd/sandbox-init/lower.go
+@@ -0,0 +1,43 @@
++package main
++
++import (
++	"encoding/binary"
++	"fmt"
++	"os"
++
++	"golang.org/x/sys/unix"
++)
++
++// A shared lower must never replay an ext4 journal or otherwise write its source.
++func readonlyLowerType(super []byte) (string, string, error) {
++	if len(super) < 100 {
++		return "", "", fmt.Errorf("truncated lower superblock")
++	}
++	if binary.LittleEndian.Uint32(super[:4]) == 0xe0f5e1e2 {
++		return "erofs", "", nil
++	}
++	if binary.LittleEndian.Uint16(super[56:58]) == 0xef53 {
++		if binary.LittleEndian.Uint16(super[58:60])&1 == 0 || binary.LittleEndian.Uint32(super[96:100])&4 != 0 {
++			return "", "", fmt.Errorf("ext4 lower requires a clean filesystem without journal recovery")
++		}
++		return "ext4", "noload", nil
++	}
++	return "", "", fmt.Errorf("lower filesystem must be raw EROFS or ext4")
++}
++
++func mountReadonlyLower(device, target string) error {
++	file, err := os.Open(device)
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++	var super [100]byte
++	if _, err := file.ReadAt(super[:], 1024); err != nil {
++		return fmt.Errorf("read lower superblock: %w", err)
++	}
++	fsType, options, err := readonlyLowerType(super[:])
++	if err != nil {
++		return err
++	}
++	return unix.Mount(device, target, fsType, unix.MS_RDONLY, options)
++}
+--- /dev/null
++++ b/cmd/sandbox-init/lower_test.go
+@@ -0,0 +1,43 @@
++package main
++
++import (
++	"encoding/binary"
++	"testing"
++)
++
++func TestReadonlyLowerFormatsAndJournalSafety(t *testing.T) {
++	for _, tc := range []struct {
++		name     string
++		erofs    bool
++		state    uint16
++		incompat uint32
++		fsType   string
++		options  string
++	}{
++		{"erofs", true, 0, 0, "erofs", ""},
++		{"clean ext4", false, 1, 0, "ext4", "noload"},
++		{"unclean ext4", false, 0, 0, "", ""},
++		{"recovery ext4", false, 1, 4, "", ""},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var super [100]byte
++			if tc.erofs {
++				binary.LittleEndian.PutUint32(super[:4], 0xe0f5e1e2)
++			} else {
++				binary.LittleEndian.PutUint16(super[56:58], 0xef53)
++				binary.LittleEndian.PutUint16(super[58:60], tc.state)
++				binary.LittleEndian.PutUint32(super[96:100], tc.incompat)
++			}
++			fsType, options, err := readonlyLowerType(super[:])
++			if (err != nil) != (tc.fsType == "") || fsType != tc.fsType || options != tc.options {
++				t.Fatalf("got %q %q %v", fsType, options, err)
++			}
++		})
++	}
++	if _, _, err := readonlyLowerType(make([]byte, 100)); err == nil {
++		t.Fatal("unknown filesystem accepted")
++	}
++	if _, _, err := readonlyLowerType(nil); err == nil {
++		t.Fatal("truncated superblock accepted")
++	}
++}

@@ -1,0 +1,229 @@
+From 44e1b2c981c369adb67f5bf5162cd05e2a5c3378 Mon Sep 17 00:00:00 2001
+From: gokwok <531504879@qq.com>
+Date: Wed, 9 Sep 2026 06:40:34 +0800
+Subject: [PATCH] virtio-devices: Reserve queue kick eventfds in prewarm profiles
+
+Use the existing VM-owned resource path to transfer pristine queue kick
+eventfds into PCI transports. Keep interrupt and control descriptors on
+the ordinary allocation path, and never recycle consumed counters.
+
+Assisted-by: Codex:GPT-6
+Signed-off-by: gokwok <531504879@qq.com>
+---
+ docs/prewarm.md                            | 14 +++++++
+ virtio-devices/src/prepared.rs             | 45 ++++++++++++++++++++--
+ virtio-devices/src/transport/pci_device.rs | 16 ++++++--
+ vmm/src/api/openapi/cloud-hypervisor.yaml  |  4 +-
+ vmm/src/lib.rs                             |  4 +-
+ vmm/src/prewarm.rs                         |  1 +
+ 6 files changed, 76 insertions(+), 8 deletions(-)
+
+diff --git a/docs/prewarm.md b/docs/prewarm.md
+index 581f9d998..89cd1a835 100644
+--- a/docs/prewarm.md
++++ b/docs/prewarm.md
+@@ -51,3 +51,17 @@ and the activation-time filter installation are unchanged.
+ 
+ Restores with Landlock enabled discard device reservations and use ordinary
+ allocation, so workers inherit restrictions at the normal activation point.
++
++## Profile prewarm queue kick eventfds
++
++The same device profile also reserves pristine nonblocking queue kick
++eventfds, bounded by 4096. `eventfds` reports the reserved count: block queues,
++network RX/TX queues plus one control queue per device, console 2, RNG 1,
++PMEM 1 per device, vsock 3 and balloon 4. These are capacity hints, so the
++actual topology may consume fewer entries or fall back to ordinary allocation.
++
++Only the PCI transport's queue eventfd creation draws from this VM-owned
++reserve. Interrupt, MSI-X, kill and pause descriptors keep their original
++allocation paths. Each descriptor is transferred once; used eventfds are
++never recycled. Hotplug allocates normally. Remaining descriptors close with
++the reserve on delete or failed restore.
+diff --git a/virtio-devices/src/prepared.rs b/virtio-devices/src/prepared.rs
+index 667e80d85..709449ee1 100644
+--- a/virtio-devices/src/prepared.rs
++++ b/virtio-devices/src/prepared.rs
+@@ -6,10 +6,12 @@
+ use std::{io, mem, ptr};
+ 
+ use seccompiler::SeccompAction;
++use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+ 
+ use crate::seccomp_filters::Thread;
+ 
+ pub struct DeviceResources {
++    eventfds: Mutex<Vec<EventFd>>,
+     workers: Mutex<Vec<PreparedWorker>>,
+     creator: thread::ThreadId,
+     environment: ThreadEnvironment,
+@@ -99,7 +101,13 @@ fn drop(&mut self) {
+ }
+ 
+ impl DeviceResources {
+-    pub fn new(action: &SeccompAction, kinds: &[Thread]) -> io::Result<Self> {
++    pub fn new(action: &SeccompAction, kinds: &[Thread], eventfd_count: usize) -> io::Result<Self> {
++        if eventfd_count > 4096 {
++            return Err(io::Error::other("Event descriptor reserve exceeds limit"));
++        }
++        let eventfds = (0..eventfd_count)
++            .map(|_| EventFd::new(EFD_NONBLOCK))
++            .collect::<io::Result<Vec<_>>>()?;
+         if kinds.len() > 256 {
+             return Err(io::Error::other("Worker reserve exceeds limit"));
+         }
+@@ -130,11 +138,21 @@ pub fn new(action: &SeccompAction, kinds: &[Thread]) -> io::Result<Self> {
+         }
+         Ok(Self {
+             workers: Mutex::new(prepared),
++            eventfds: Mutex::new(eventfds),
+             creator: thread::current().id(),
+             environment,
+         })
+     }
+ 
++    /// Transfer a pristine queue kick descriptor; never recycle used counters.
++    pub(crate) fn eventfd(&self) -> io::Result<EventFd> {
++        self.eventfds
++            .lock()
++            .unwrap()
++            .pop()
++            .map_or_else(|| EventFd::new(EFD_NONBLOCK), Ok)
++    }
++
+     pub(crate) fn spawn<F>(
+         &self,
+         name: &str,
+@@ -183,6 +201,7 @@ fn unused_workers_join_and_dispatched_jobs_survive_reserve_drop() {
+         let resources = DeviceResources::new(
+             &SeccompAction::Allow,
+             &[Thread::VirtioBlock, Thread::VirtioNet],
++            0,
+         )
+         .unwrap();
+         let reserved_id = resources.workers.lock().unwrap()[0]
+@@ -209,7 +228,7 @@ fn unused_workers_join_and_dispatched_jobs_survive_reserve_drop() {
+     #[test]
+     fn changed_environment_and_foreign_dispatch_do_not_consume_workers() {
+         let mut resources =
+-            DeviceResources::new(&SeccompAction::Allow, &[Thread::VirtioBlock]).unwrap();
++            DeviceResources::new(&SeccompAction::Allow, &[Thread::VirtioBlock], 0).unwrap();
+         // Model a changed policy without changing the test runner's scheduler.
+         resources.environment.priority += 1;
+         resources
+@@ -264,7 +283,27 @@ fn changed_environment_and_foreign_dispatch_do_not_consume_workers() {
+             .unwrap();
+         assert!(resources.workers.lock().unwrap().is_empty());
+         assert!(
+-            DeviceResources::new(&SeccompAction::Allow, &vec![Thread::VirtioBlock; 257]).is_err()
++            DeviceResources::new(&SeccompAction::Allow, &vec![Thread::VirtioBlock; 257], 0)
++                .is_err()
++        );
++    }
++    #[test]
++    fn descriptor_reserves_are_pristine_single_use_and_vm_local() {
++        let a = DeviceResources::new(&SeccompAction::Allow, &[], 1).unwrap();
++        let b = DeviceResources::new(&SeccompAction::Allow, &[], 1).unwrap();
++        let first = a.eventfd().unwrap();
++        let fallback = a.eventfd().unwrap();
++        first.write(3).unwrap();
++        assert_eq!(
++            fallback.read().unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
++        );
++        assert_eq!(
++            b.eventfd().unwrap().read().unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
+         );
++        drop(a);
++        assert_eq!(first.read().unwrap(), 3);
++        assert!(DeviceResources::new(&SeccompAction::Allow, &[], 4097).is_err());
+     }
+ }
+diff --git a/virtio-devices/src/transport/pci_device.rs b/virtio-devices/src/transport/pci_device.rs
+index 32d5f2563..e218f515d 100644
+--- a/virtio-devices/src/transport/pci_device.rs
++++ b/virtio-devices/src/transport/pci_device.rs
+@@ -444,9 +444,19 @@ pub fn new(
+         let mut locked_device = device.lock().unwrap();
+         let mut queue_evts = Vec::new();
+         for _ in locked_device.queue_max_sizes().iter() {
+-            queue_evts.push(EventFd::new(EFD_NONBLOCK).map_err(|e| {
+-                VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!("Failed creating eventfd: {e}"))
+-            })?);
++            queue_evts.push(
++                resources
++                    .as_ref()
++                    .map_or_else(
++                        || EventFd::new(EFD_NONBLOCK),
++                        |resources| resources.eventfd(),
++                    )
++                    .map_err(|e| {
++                        VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
++                            "Failed creating eventfd: {e}"
++                        ))
++                    })?,
++            );
+         }
+         let num_queues = locked_device.queue_max_sizes().len();
+ 
+diff --git a/vmm/src/api/openapi/cloud-hypervisor.yaml b/vmm/src/api/openapi/cloud-hypervisor.yaml
+index f397c905b..ed0dd8707 100644
+--- a/vmm/src/api/openapi/cloud-hypervisor.yaml
++++ b/vmm/src/api/openapi/cloud-hypervisor.yaml
+@@ -68,7 +68,7 @@ paths:
+             application/json:
+               schema:
+                 type: object
+-                required: [vm, vcpus, workers]
++                required: [vm, vcpus, workers, eventfds]
+                 properties:
+                   vm:
+                     type: boolean
+@@ -76,6 +76,8 @@ paths:
+                     type: integer
+                   workers:
+                     type: integer
++                  eventfds:
++                    type: integer
+         '500':
+           description: Preparation failed
+ 
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 5123aa83b..22c7f79a3 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -2847,11 +2847,12 @@ fn vmm_prepare(&mut self, config: prewarm::PrepareConfig) -> result::Result<Vec<
+                 .map_err(VmError::Prepare)?;
+         }
+         let kinds = config.worker_kinds().map_err(VmError::Prepare)?;
++        let eventfds = config.queue_count().map_err(VmError::Prepare)?;
+         let devices = if kinds.is_empty() {
+             None
+         } else {
+             Some(Arc::new(
+-                DeviceResources::new(&self.seccomp_action, &kinds)
++                DeviceResources::new(&self.seccomp_action, &kinds, eventfds)
+                     .map_err(|error| VmError::Prepare(error.into()))?,
+             ))
+         };
+@@ -2861,6 +2862,7 @@ fn vmm_prepare(&mut self, config: prewarm::PrepareConfig) -> result::Result<Vec<
+             vm: true,
+             vcpus: config.vcpu_ids.len(),
+             workers: kinds.len(),
++            eventfds,
+         })
+         .map_err(|error| VmError::Prepare(error.into()))
+     }
+diff --git a/vmm/src/prewarm.rs b/vmm/src/prewarm.rs
+index 3ea6d6d03..72bfce14e 100644
+--- a/vmm/src/prewarm.rs
++++ b/vmm/src/prewarm.rs
+@@ -159,6 +159,7 @@ pub struct PrepareResponse {
+     pub vm: bool,
+     pub vcpus: usize,
+     pub workers: usize,
++    pub eventfds: usize,
+ }
+ 
+ /// Preparation is limited to the KVM architectures with descriptor support.

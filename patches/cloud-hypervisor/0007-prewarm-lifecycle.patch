@@ -1,0 +1,392 @@
+From 09a9393fd2c28ecf37bad6dda800fd3af38729e2 Mon Sep 17 00:00:00 2001
+From: gokwok <531504879@qq.com>
+Date: Wed, 9 Sep 2026 12:19:03 +0800
+Subject: [PATCH] vmm: Advertise and own generic/profile prewarm preparation lifecycle
+
+Keep structured v2 capabilities, idempotent retries, generic-to-profile upgrades and VM-owned cleanup independent of template preparation. Template prewarm uses upstream paused restore and resume without a custom API.
+
+Assisted-by: Codex:GPT-6
+Signed-off-by: gokwok <531504879@qq.com>
+---
+ docs/prewarm.md                           | 24 +++++-
+ fuzz/fuzz_targets/http_api.rs             |  1 +
+ vmm/src/api/mod.rs                        |  4 +-
+ vmm/src/api/openapi/cloud-hypervisor.yaml | 11 +++
+ vmm/src/lib.rs                            | 97 +++++++++++++++--------
+ vmm/src/prewarm.rs                        | 79 +++++++++++++++++-
+ 6 files changed, 177 insertions(+), 39 deletions(-)
+
+diff --git a/docs/prewarm.md b/docs/prewarm.md
+index 89cd1a835..c0e98efef 100644
+--- a/docs/prewarm.md
++++ b/docs/prewarm.md
+@@ -6,8 +6,9 @@ an empty default KVM VM without guest memory, devices or guest execution.
+ A subsequent ordinary restore consumes it. Confidential VM types use the
+ ordinary constructor instead. Other hypervisor backends reject preparation.
+ 
+-Preparation is single-use. A repeated request is rejected. Delete discards
+-unused preparation; after a failed preparation, replace the VMM process.
++Preparation is single-use. Identical requests are idempotent. Generic prewarm can
++upgrade to one prewarm profile; a nonempty profile cannot be rebound. Delete discards
++unused preparation; after an allocation failure, replace the VMM process.
+ These interfaces are proposed extensions, not upstream compatibility promises.
+ 
+ Preparation also compiles the existing virtio seccomp filters before restore.
+@@ -21,7 +22,7 @@ initialization stays in the existing CPU restore path. Unused descriptors
+ are owned by the prepared VM and dropped with it. Empty IDs with no device profile retain generic prewarm only.
+ 
+ Prepared vCPU IDs must match the actual restored boot CPU count and topology.
+-A mismatch is rejected before restoring state or preparing template memory;
++A mismatch is rejected before restoring state;
+ unused reserved kernel vCPUs are never silently attached to a different VM.
+ 
+ ## Profile prewarm device workers
+@@ -65,3 +66,20 @@ reserve. Interrupt, MSI-X, kill and pause descriptors keep their original
+ allocation paths. Each descriptor is transferred once; used eventfds are
+ never recycled. Hotplug allocates normally. Remaining descriptors close with
+ the reserve on delete or failed restore.
++
++## Capability and lifecycle
++
++Ping advertises `prewarm:{"version":2,"generic_prepare":true,"profile_prepare":true}`
++on supported KVM backends. One owned generic/profile state transfers to normal
++VM construction. Ordinary create discards idle preparation; receive-migration
++requires deleting it first. Invalid profile requests leave the existing reserve
++intact, while a failed resource transition drops the consumed reserve.
++
++## Template prewarm using upstream paused restore
++
++Template prewarm means a fully restored, paused VM: issue `vm.restore` with
++`memory_restore_mode:"CopyOnWrite"`, `prefault:false`, and `resume:false`, then
++issue `vm.resume` when assigned. Bind private disks, network and vsock resources
++before restore and retain them with immutable snapshot backing until teardown.
++The guest does not execute while paused; untouched RAM remains demand-paged.
++No custom template-preparation API, hotset population or KVM prefetch is added.
+diff --git a/fuzz/fuzz_targets/http_api.rs b/fuzz/fuzz_targets/http_api.rs
+index 56e9e55c6..9c2741db0 100644
+--- a/fuzz/fuzz_targets/http_api.rs
++++ b/fuzz/fuzz_targets/http_api.rs
+@@ -232,6 +232,7 @@ fn vm_balloon_stats(&self) -> Result<BalloonStatsResponse, VmError> {
+ 
+     fn vmm_ping(&self) -> VmmPingResponse {
+         VmmPingResponse {
++            prewarm: None,
+             build_version: String::new(),
+             version: String::new(),
+             pid: 0,
+diff --git a/vmm/src/api/mod.rs b/vmm/src/api/mod.rs
+index d4caaa722..d64b6c89a 100644
+--- a/vmm/src/api/mod.rs
++++ b/vmm/src/api/mod.rs
+@@ -61,7 +61,7 @@
+ use crate::migration::transport::{
+     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
+ };
+-use crate::prewarm::PrepareConfig;
++use crate::prewarm::{Capabilities, PrepareConfig};
+ use crate::vm::{Error as VmError, VmState};
+ use crate::vm_config::{
+     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
+@@ -231,6 +231,8 @@ pub struct BalloonStatsResponse {
+ 
+ #[derive(Clone, Deserialize, Serialize)]
+ pub struct VmmPingResponse {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub prewarm: Option<Capabilities>,
+     pub build_version: String,
+     pub version: String,
+     pub pid: i64,
+diff --git a/vmm/src/api/openapi/cloud-hypervisor.yaml b/vmm/src/api/openapi/cloud-hypervisor.yaml
+index ed0dd8707..b90c9112b 100644
+--- a/vmm/src/api/openapi/cloud-hypervisor.yaml
++++ b/vmm/src/api/openapi/cloud-hypervisor.yaml
+@@ -650,6 +650,17 @@ components:
+         - version
+       type: object
+       properties:
++        prewarm:
++          description: Optional generic/profile prewarm preparation protocol.
++          type: object
++          properties:
++            version:
++              type: integer
++              enum: [2]
++            generic_prepare:
++              type: boolean
++            profile_prepare:
++              type: boolean
+         build_version:
+           type: string
+         version:
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 22c7f79a3..f86985a14 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -712,8 +712,7 @@ pub struct Vmm {
+     vm_config: Option<Arc<Mutex<VmConfig>>>,
+     seccomp_action: SeccompAction,
+     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+-    precreated_vm: Option<prewarm::PreparedVm>,
+-    prepared_vcpu_ids: Vec<u32>,
++    preparation: Option<prewarm::Preparation>,
+     activate_evt: EventFd,
+     signals: Option<Handle>,
+     threads: Vec<thread::JoinHandle<()>>,
+@@ -947,8 +946,7 @@ fn new(
+             vm_config: None,
+             seccomp_action,
+             hypervisor,
+-            precreated_vm: None,
+-            prepared_vcpu_ids: Vec::new(),
++            preparation: None,
+             activate_evt,
+             signals: None,
+             threads: vec![],
+@@ -2102,7 +2100,7 @@ fn vm_restore(
+                     Some(source_url),
+                     Some(prefault),
+                     Some(memory_restore_mode),
+-                    self.precreated_vm.take(),
++                    self.preparation.take().map(prewarm::Preparation::into_vm),
+                 )?;
+ 
+                 if self
+@@ -2431,6 +2429,7 @@ fn update_memory_zones(
+ 
+ impl RequestHandler for Vmm {
+     fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
++        self.preparation = None;
+         match &self.vm {
+             VmOwnership::Migration { .. } => return Err(VmError::VmMigrating),
+             VmOwnership::Owned(_) | VmOwnership::None => {}
+@@ -2596,7 +2595,12 @@ fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmErr
+                     .map_err(VmError::ConfigValidation)?;
+ 
+                 prewarm::validate_vcpu_ids(
+-                    &self.prepared_vcpu_ids,
++                    &self
++                        .preparation
++                        .as_ref()
++                        .map(prewarm::Preparation::profile)
++                        .map(|p| p.vcpu_ids)
++                        .unwrap_or_default(),
+                     &vm_config.lock().unwrap().cpus,
+                 )
+                 .map_err(VmError::Prepare)?;
+@@ -2827,44 +2831,60 @@ fn vm_balloon_stats(&self) -> result::Result<BalloonStatsResponse, VmError> {
+     }
+ 
+     fn vmm_prepare(&mut self, config: prewarm::PrepareConfig) -> result::Result<Vec<u8>, VmError> {
+-        if self.vm_config.is_some() || self.precreated_vm.is_some() {
+-            return Err(VmError::Prepare(anyhow!("VMM is not unprepared and idle")));
++        if self.vm_config.is_some() || !matches!(self.vm, VmOwnership::None) {
++            return Err(VmError::Prepare(anyhow!("VMM is not idle")));
+         }
+         if !prewarm::supported(self.hypervisor.as_ref()) {
+             return Err(VmError::Prepare(anyhow!(
+                 "Backend does not support preparation"
+             )));
+         }
+-        config.validate().map_err(VmError::Prepare)?;
+-        precompile_seccomp_filters(&self.seccomp_action)
+-            .map_err(|error| VmError::Prepare(error.into()))?;
+-        let vm = Vm::create_hypervisor_vm(
+-            self.hypervisor.as_ref(),
+-            hypervisor::HypervisorVmConfig::default(),
+-        )?;
+-        if !config.vcpu_ids.is_empty() {
+-            vm.prepare_vcpus(&config.vcpu_ids)
+-                .map_err(VmError::Prepare)?;
+-        }
++        let current = self.preparation.as_ref().map(prewarm::Preparation::profile);
++        prewarm::validate_profile_transition(current.as_ref(), &config)
++            .map_err(VmError::Prepare)?;
+         let kinds = config.worker_kinds().map_err(VmError::Prepare)?;
+         let eventfds = config.queue_count().map_err(VmError::Prepare)?;
+-        let devices = if kinds.is_empty() {
+-            None
+-        } else {
+-            Some(Arc::new(
+-                DeviceResources::new(&self.seccomp_action, &kinds, eventfds)
+-                    .map_err(|error| VmError::Prepare(error.into()))?,
+-            ))
+-        };
+-        self.prepared_vcpu_ids = config.vcpu_ids.clone();
+-        self.precreated_vm = Some(prewarm::PreparedVm { vm, devices });
+-        serde_json::to_vec(&prewarm::PrepareResponse {
++        let response = serde_json::to_vec(&prewarm::PrepareResponse {
+             vm: true,
+             vcpus: config.vcpu_ids.len(),
+             workers: kinds.len(),
+             eventfds,
+         })
+-        .map_err(|error| VmError::Prepare(error.into()))
++        .map_err(|e| VmError::Prepare(e.into()))?;
++        if current.as_ref() == Some(&config) {
++            return Ok(response);
++        }
++        let previous = self.preparation.take();
++        precompile_seccomp_filters(&self.seccomp_action).map_err(|e| VmError::Prepare(e.into()))?;
++        let vm = match previous {
++            Some(prepared) => prepared.into_vm().vm,
++            None => Vm::create_hypervisor_vm(
++                self.hypervisor.as_ref(),
++                hypervisor::HypervisorVmConfig::default(),
++            )?,
++        };
++        self.preparation = Some(if config == prewarm::PrepareConfig::default() {
++            prewarm::Preparation::Generic(vm)
++        } else {
++            if !config.vcpu_ids.is_empty() {
++                vm.prepare_vcpus(&config.vcpu_ids)
++                    .map_err(VmError::Prepare)?;
++            }
++            let devices = if kinds.is_empty() {
++                None
++            } else {
++                Some(Arc::new(
++                    DeviceResources::new(&self.seccomp_action, &kinds, eventfds)
++                        .map_err(|error| VmError::Prepare(error.into()))?,
++                ))
++            };
++            prewarm::Preparation::Profile {
++                vm,
++                profile: config,
++                devices,
++            }
++        });
++        Ok(response)
+     }
+ 
+     fn vmm_ping(&self) -> VmmPingResponse {
+@@ -2878,12 +2898,18 @@ fn vmm_ping(&self) -> VmmPingResponse {
+             version,
+             pid: process::id() as i64,
+             features: feature_list(),
++            prewarm: prewarm::supported(self.hypervisor.as_ref()).then_some(
++                prewarm::Capabilities {
++                    version: 2,
++                    generic_prepare: true,
++                    profile_prepare: true,
++                },
++            ),
+         }
+     }
+ 
+     fn vm_delete(&mut self) -> result::Result<(), VmError> {
+-        self.precreated_vm = None;
+-        self.prepared_vcpu_ids.clear();
++        self.preparation = None;
+         if self.vm_config.is_none() {
+             return Ok(());
+         }
+@@ -3320,6 +3346,11 @@ fn vm_receive_migration(
+         &mut self,
+         receive_data_migration: VmReceiveMigrationData,
+     ) -> result::Result<(), MigratableError> {
++        if self.preparation.is_some() {
++            return Err(MigratableError::MigrateReceive(anyhow!(
++                "Delete idle preparation before receiving migration"
++            )));
++        }
+         match &self.vm {
+             VmOwnership::Owned(_vm) => {
+                 return Err(MigratableError::MigrateReceive(anyhow!(
+diff --git a/vmm/src/prewarm.rs b/vmm/src/prewarm.rs
+index 72bfce14e..b0ef58b26 100644
+--- a/vmm/src/prewarm.rs
++++ b/vmm/src/prewarm.rs
+@@ -60,7 +60,7 @@ fn ordinary_cpu_policy_does_not_change_kvm_vm_type() {
+     }
+ }
+ 
+-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
++#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct PrepareConfig {
+     #[serde(default)]
+@@ -304,8 +304,83 @@ fn reject_extra_reserved_vcpus_and_topology_mismatch() {
+     }
+ }
+ 
+-/// Restore owns the VM and all remaining device reservations together.
++/// Every idle phase owns its resources. Taking this value transfers the whole
++/// preparation; a failed transition drops the VM and its kernel descriptors.
++pub(crate) enum Preparation {
++    Generic(Arc<dyn hypervisor::Vm>),
++    Profile {
++        vm: Arc<dyn hypervisor::Vm>,
++        profile: PrepareConfig,
++        devices: Option<Arc<DeviceResources>>,
++    },
++}
++
+ pub struct PreparedVm {
+     pub vm: Arc<dyn hypervisor::Vm>,
+     pub devices: Option<Arc<DeviceResources>>,
+ }
++
++impl Preparation {
++    pub(crate) fn profile(&self) -> PrepareConfig {
++        match self {
++            Self::Generic(_) => PrepareConfig::default(),
++            Self::Profile { profile, .. } => profile.clone(),
++        }
++    }
++
++    pub(crate) fn into_vm(self) -> PreparedVm {
++        match self {
++            Self::Generic(vm) => PreparedVm { vm, devices: None },
++            Self::Profile { vm, devices, .. } => PreparedVm { vm, devices },
++        }
++    }
++}
++
++pub fn validate_profile_transition(
++    current: Option<&PrepareConfig>,
++    next: &PrepareConfig,
++) -> anyhow::Result<()> {
++    next.validate()?;
++    if current.is_some_and(|profile| *profile != PrepareConfig::default() && profile != next) {
++        anyhow::bail!("Preparation is already bound to a different profile");
++    }
++    Ok(())
++}
++
++#[derive(Clone, Deserialize, Serialize)]
++pub struct Capabilities {
++    pub version: u32,
++    pub generic_prepare: bool,
++    pub profile_prepare: bool,
++}
++
++#[cfg(test)]
++mod transition_tests {
++    use super::*;
++    #[test]
++    fn only_generic_preparation_can_change_profile() {
++        let generic = PrepareConfig::default();
++        let one = PrepareConfig {
++            vcpu_ids: vec![0],
++            ..Default::default()
++        };
++        let two = PrepareConfig {
++            vcpu_ids: vec![0, 1],
++            ..Default::default()
++        };
++        validate_profile_transition(None, &generic).unwrap();
++        validate_profile_transition(Some(&generic), &two).unwrap();
++        validate_profile_transition(Some(&two), &two).unwrap();
++        validate_profile_transition(Some(&two), &one).unwrap_err();
++        validate_profile_transition(Some(&two), &generic).unwrap_err();
++        let devices = PrepareConfig {
++            rng: true,
++            ..Default::default()
++        };
++        validate_profile_transition(Some(&generic), &devices).unwrap();
++        validate_profile_transition(Some(&devices), &devices).unwrap();
++        validate_profile_transition(Some(&devices), &generic).unwrap_err();
++        validate_profile_transition(Some(&devices), &two).unwrap_err();
++        serde_json::from_str::<PrepareConfig>(r#"{"workers":1}"#).unwrap_err();
++    }
++}

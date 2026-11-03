@@ -1,0 +1,380 @@
+From ca1bc6ddc2d8855f9dfc3cc94e245ab5f3f37c5d Mon Sep 17 00:00:00 2001
+From: gokwok <531504879@qq.com>
+Date: Tue, 8 Sep 2026 23:05:29 +0800
+Subject: [PATCH] hypervisor: Reserve KVM vCPU descriptors before restore
+
+Add bounded explicit vCPU preparation for x86_64 and aarch64 KVM.
+Reuse descriptors in the existing create_vcpu path; leave architectural
+initialization there. VM ownership handles partial-allocation cleanup.
+Other backends report unsupported preparation and keep normal creation.
+
+Assisted-by: Codex:GPT-6
+Signed-off-by: gokwok <531504879@qq.com>
+---
+ docs/prewarm.md                           |  11 +++
+ hypervisor/src/kvm/mod.rs                 |  37 ++++++--
+ hypervisor/src/vm.rs                      |   5 +
+ vmm/src/api/openapi/cloud-hypervisor.yaml |   7 ++
+ vmm/src/lib.rs                            |  29 +++++-
+ vmm/src/prewarm.rs                        | 107 +++++++++++++++++++++-
+ 6 files changed, 182 insertions(+), 14 deletions(-)
+
+diff --git a/docs/prewarm.md b/docs/prewarm.md
+index ffc931c57..935c53896 100644
+--- a/docs/prewarm.md
++++ b/docs/prewarm.md
+@@ -12,3 +12,14 @@ These interfaces are proposed extensions, not upstream compatibility promises.
+ 
+ Preparation also compiles the existing virtio seccomp filters before restore.
+ Workers still install their own filters before running device code.
++
++## CPU profile preparation
++
++`vmm.prepare` accepts `vcpu_ids`, consecutive IDs starting at zero (at most
++256). KVM descriptor creation happens before restore; architectural state
++initialization stays in the existing CPU restore path. Unused descriptors
++are owned by the prepared VM and dropped with it. Empty IDs retain generic prewarm only.
++
++Prepared vCPU IDs must match the actual restored boot CPU count and topology.
++A mismatch is rejected before restoring state or preparing template memory;
++unused reserved kernel vCPUs are never silently attached to a different VM.
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index 76b7b6309..a7c32de6d 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -11,7 +11,9 @@
+ //
+ 
+ use std::any::Any;
+-use std::collections::HashMap;
++#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++use std::collections::btree_map::Entry;
++use std::collections::{BTreeMap, HashMap};
+ #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+ use std::mem::offset_of;
+ #[cfg(feature = "sev_snp")]
+@@ -24,13 +26,11 @@
+ use std::os::unix::io::RawFd;
+ #[cfg(feature = "tdx")]
+ use std::ptr;
+-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+-use std::sync::Mutex;
+ #[cfg(feature = "sev_snp")]
+ use std::sync::OnceLock;
+ #[cfg(target_arch = "x86_64")]
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::sync::{Arc, RwLock};
++use std::sync::{Arc, Mutex, RwLock};
+ #[cfg(target_arch = "aarch64")]
+ use std::time::{SystemTime, UNIX_EPOCH};
+ use std::{fs, io, result};
+@@ -632,6 +632,7 @@ struct KvmMemorySlot {
+ 
+ /// Wrapper over KVM VM ioctls.
+ pub struct KvmVm {
++    prepared_vcpus: Mutex<BTreeMap<u32, VcpuFd>>,
+     fd: Arc<VmFd>,
+     #[cfg(target_arch = "x86_64")]
+     msrs: Vec<MsrEntry>,
+@@ -752,6 +753,20 @@ unsafe fn set_user_memory_region(
+ /// let vm = hypervisor.create_vm(HypervisorVmConfig::default()).expect("new VM fd creation failed");
+ /// ```
+ impl vm::Vm for KvmVm {
++    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++    fn prepare_vcpus(&self, ids: &[u32]) -> anyhow::Result<()> {
++        if ids.len() > 256 {
++            anyhow::bail!("VCPU reserve exceeds limit");
++        }
++        let mut reserve = self.prepared_vcpus.lock().unwrap();
++        for &id in ids {
++            if let Entry::Vacant(entry) = reserve.entry(id) {
++                entry.insert(self.fd.create_vcpu(u64::from(id))?);
++            }
++        }
++        Ok(())
++    }
++
+     #[cfg(feature = "sev_snp")]
+     fn register_memory_conversion_handler(&self, handler: Arc<dyn vm::MemoryConversionHandler>) {
+         self.memory_conversion_handler
+@@ -889,10 +904,14 @@ fn create_vcpu(
+         vm_ops: Option<Arc<dyn VmOps>>,
+         #[cfg(target_arch = "x86_64")] msr_config_update: Option<VcpuMsrConfigUpdate>,
+     ) -> vm::Result<Box<dyn cpu::Vcpu>> {
+-        let fd = self
+-            .fd
+-            .create_vcpu(id as u64)
+-            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
++        let prepared = self.prepared_vcpus.lock().unwrap().remove(&id);
++        let fd = match prepared {
++            Some(fd) => fd,
++            None => self
++                .fd
++                .create_vcpu(id as u64)
++                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?,
++        };
+ 
+         #[cfg(target_arch = "riscv64")]
+         {
+@@ -1792,6 +1811,7 @@ fn create_vm(&self, _config: HypervisorVmConfig) -> hypervisor::Result<Arc<dyn v
+             };
+ 
+             Ok(Arc::new(KvmVm {
++                prepared_vcpus: Mutex::new(BTreeMap::new()),
+                 fd: Arc::new(fd),
+                 msrs,
+                 dirty_log_slots: RwLock::new(HashMap::new()),
+@@ -1808,6 +1828,7 @@ fn create_vm(&self, _config: HypervisorVmConfig) -> hypervisor::Result<Arc<dyn v
+         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+         {
+             Ok(Arc::new(KvmVm {
++                prepared_vcpus: Mutex::new(BTreeMap::new()),
+                 fd: Arc::new(fd),
+                 dirty_log_slots: RwLock::new(HashMap::new()),
+                 memory_slots: None,
+diff --git a/hypervisor/src/vm.rs b/hypervisor/src/vm.rs
+index 6744ef26f..a05c47c81 100644
+--- a/hypervisor/src/vm.rs
++++ b/hypervisor/src/vm.rs
+@@ -327,6 +327,11 @@ pub enum MemoryVisibility {
+ /// This crate provides a hypervisor-agnostic interfaces for Vm
+ ///
+ pub trait Vm: Send + Sync + Any {
++    /// Reserve vCPU descriptors without initializing architectural state.
++    fn prepare_vcpus(&self, _ids: &[u32]) -> anyhow::Result<()> {
++        anyhow::bail!("VCPU preparation is unsupported by this backend")
++    }
++
+     #[cfg(target_arch = "x86_64")]
+     /// Sets the address of the one-page region in the VM's address space.
+     fn set_identity_map_address(&self, address: u64) -> Result<()>;
+diff --git a/vmm/src/api/openapi/cloud-hypervisor.yaml b/vmm/src/api/openapi/cloud-hypervisor.yaml
+index 6bc51490e..1d3da7159 100644
+--- a/vmm/src/api/openapi/cloud-hypervisor.yaml
++++ b/vmm/src/api/openapi/cloud-hypervisor.yaml
+@@ -22,6 +22,13 @@ paths:
+             schema:
+               type: object
+               additionalProperties: false
++              properties:
++                vcpu_ids:
++                  type: array
++                  maxItems: 256
++                  items:
++                    type: integer
++                    minimum: 0
+       responses:
+         '200':
+           description: Empty default KVM VM prepared
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 22f600aca..299474c3f 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -712,6 +712,7 @@ pub struct Vmm {
+     seccomp_action: SeccompAction,
+     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+     precreated_vm: Option<Arc<dyn hypervisor::Vm>>,
++    prepared_vcpu_ids: Vec<u32>,
+     activate_evt: EventFd,
+     signals: Option<Handle>,
+     threads: Vec<thread::JoinHandle<()>>,
+@@ -946,6 +947,7 @@ fn new(
+             seccomp_action,
+             hypervisor,
+             precreated_vm: None,
++            prepared_vcpu_ids: Vec::new(),
+             activate_evt,
+             signals: None,
+             threads: vec![],
+@@ -2591,6 +2593,12 @@ fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmErr
+                     .validate(&vm_config.lock().unwrap().clone())
+                     .map_err(VmError::ConfigValidation)?;
+ 
++                prewarm::validate_vcpu_ids(
++                    &self.prepared_vcpu_ids,
++                    &vm_config.lock().unwrap().cpus,
++                )
++                .map_err(VmError::Prepare)?;
++
+                 // Update VM's net configurations with new fds received for restore operation
+                 if let (Some(restored_nets), Some(vm_net_configs)) =
+                     (restore_cfg.net_fds, &mut vm_config.lock().unwrap().net)
+@@ -2816,7 +2824,7 @@ fn vm_balloon_stats(&self) -> result::Result<BalloonStatsResponse, VmError> {
+         }
+     }
+ 
+-    fn vmm_prepare(&mut self, _config: prewarm::PrepareConfig) -> result::Result<Vec<u8>, VmError> {
++    fn vmm_prepare(&mut self, config: prewarm::PrepareConfig) -> result::Result<Vec<u8>, VmError> {
+         if self.vm_config.is_some() || self.precreated_vm.is_some() {
+             return Err(VmError::Prepare(anyhow!("VMM is not unprepared and idle")));
+         }
+@@ -2825,14 +2833,24 @@ fn vmm_prepare(&mut self, _config: prewarm::PrepareConfig) -> result::Result<Vec
+                 "Backend does not support preparation"
+             )));
+         }
++        config.validate().map_err(VmError::Prepare)?;
+         precompile_seccomp_filters(&self.seccomp_action)
+             .map_err(|error| VmError::Prepare(error.into()))?;
+-        self.precreated_vm = Some(Vm::create_hypervisor_vm(
++        let vm = Vm::create_hypervisor_vm(
+             self.hypervisor.as_ref(),
+             hypervisor::HypervisorVmConfig::default(),
+-        )?);
+-        serde_json::to_vec(&prewarm::PrepareResponse { vm: true })
+-            .map_err(|error| VmError::Prepare(error.into()))
++        )?;
++        if !config.vcpu_ids.is_empty() {
++            vm.prepare_vcpus(&config.vcpu_ids)
++                .map_err(VmError::Prepare)?;
++        }
++        self.prepared_vcpu_ids = config.vcpu_ids.clone();
++        self.precreated_vm = Some(vm);
++        serde_json::to_vec(&prewarm::PrepareResponse {
++            vm: true,
++            vcpus: config.vcpu_ids.len(),
++        })
++        .map_err(|error| VmError::Prepare(error.into()))
+     }
+ 
+     fn vmm_ping(&self) -> VmmPingResponse {
+@@ -2851,6 +2869,7 @@ fn vmm_ping(&self) -> VmmPingResponse {
+ 
+     fn vm_delete(&mut self) -> result::Result<(), VmError> {
+         self.precreated_vm = None;
++        self.prepared_vcpu_ids.clear();
+         if self.vm_config.is_none() {
+             return Ok(());
+         }
+diff --git a/vmm/src/prewarm.rs b/vmm/src/prewarm.rs
+index bfccdbd9b..57308f04e 100644
+--- a/vmm/src/prewarm.rs
++++ b/vmm/src/prewarm.rs
+@@ -3,6 +3,8 @@
+ 
+ use serde::{Deserialize, Serialize};
+ 
++use crate::vm_config::CpusConfig;
++
+ /// KVM's ordinary VM type is independent of RAM size, nested policy and SMT.
+ /// Those fields affect later initialization or other backends, not create_vm.
+ pub(crate) fn compatible_vm_type(_config: &hypervisor::HypervisorVmConfig) -> bool {
+@@ -55,11 +57,30 @@ fn ordinary_cpu_policy_does_not_change_kvm_vm_type() {
+ 
+ #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+ #[serde(deny_unknown_fields)]
+-pub struct PrepareConfig {}
++pub struct PrepareConfig {
++    #[serde(default)]
++    pub vcpu_ids: Vec<u32>,
++}
++
++impl PrepareConfig {
++    pub fn validate(&self) -> anyhow::Result<()> {
++        if self.vcpu_ids.len() > 256
++            || self
++                .vcpu_ids
++                .iter()
++                .enumerate()
++                .any(|(i, &id)| id as usize != i)
++        {
++            anyhow::bail!("VCPU IDs must be consecutive from zero and bounded by 256");
++        }
++        Ok(())
++    }
++}
+ 
+ #[derive(Serialize)]
+ pub struct PrepareResponse {
+     pub vm: bool,
++    pub vcpus: usize,
+ }
+ 
+ /// Preparation is limited to the KVM architectures with descriptor support.
+@@ -74,3 +95,87 @@ pub fn supported(hypervisor: &dyn hypervisor::Hypervisor) -> bool {
+         false
+     }
+ }
++
++/// Reserved KVM vCPUs must match the actual boot IDs; unused kernel vCPUs
++/// must not remain attached to a restored VM of a different CPU profile.
++pub fn validate_vcpu_ids(ids: &[u32], config: &CpusConfig) -> anyhow::Result<()> {
++    if ids.is_empty() {
++        return Ok(());
++    }
++    if ids.len() != config.boot_vcpus as usize {
++        anyhow::bail!("Prepared vCPU count does not match restore configuration");
++    }
++    #[cfg(target_arch = "x86_64")]
++    let topology = config.topology.as_ref().map(|t| {
++        (
++            t.threads_per_core,
++            t.cores_per_die,
++            t.dies_per_package,
++            t.packages,
++        )
++    });
++    #[cfg(target_arch = "x86_64")]
++    if topology.is_some_and(|(a, b, c, d)| a == 0 || b == 0 || c == 0 || d == 0) {
++        anyhow::bail!("Invalid prepared CPU topology");
++    }
++    for (index, &id) in ids.iter().enumerate() {
++        #[cfg(target_arch = "x86_64")]
++        let expected = arch::x86_64::get_x2apic_id(index as u32, topology);
++        #[cfg(not(target_arch = "x86_64"))]
++        let expected = index as u32;
++        if id != expected {
++            anyhow::bail!("Prepared vCPU IDs do not match restore topology");
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn reject_invalid_cpu_profile_before_preparing_resources() {
++        for ids in [vec![1], vec![0, 0], vec![0, 2], (0..257).collect()] {
++            PrepareConfig { vcpu_ids: ids }.validate().unwrap_err();
++        }
++        PrepareConfig::default().validate().unwrap();
++        PrepareConfig {
++            vcpu_ids: vec![0, 1],
++        }
++        .validate()
++        .unwrap();
++    }
++}
++
++#[cfg(test)]
++mod cpu_binding_tests {
++    use super::*;
++    #[test]
++    fn reject_extra_reserved_vcpus_and_topology_mismatch() {
++        let config = CpusConfig {
++            boot_vcpus: 2,
++            max_vcpus: 2,
++            ..Default::default()
++        };
++        validate_vcpu_ids(&[0, 1], &config).unwrap();
++        validate_vcpu_ids(&[0, 1, 2], &config).unwrap_err();
++        validate_vcpu_ids(&[0], &config).unwrap_err();
++        validate_vcpu_ids(&[], &config).unwrap();
++        #[cfg(target_arch = "x86_64")]
++        {
++            use crate::vm_config::CpuTopology;
++            let config = CpusConfig {
++                boot_vcpus: 6,
++                max_vcpus: 6,
++                topology: Some(CpuTopology {
++                    threads_per_core: 1,
++                    cores_per_die: 3,
++                    dies_per_package: 2,
++                    packages: 1,
++                }),
++                ..Default::default()
++            };
++            validate_vcpu_ids(&[0, 1, 2, 3, 4, 5], &config).unwrap_err();
++        }
++    }
++}

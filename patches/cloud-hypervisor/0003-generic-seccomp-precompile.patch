@@ -1,0 +1,85 @@
+From c80fa2c3652764fe4901bd0672b16ff3953beedd Mon Sep 17 00:00:00 2001
+From: gokwok <531504879@qq.com>
+Date: Tue, 8 Sep 2026 23:05:19 +0800
+Subject: [PATCH] vmm: Precompile device filters during idle preparation
+
+Compile cached device filters during explicit idle preparation.
+Ordinary startup remains lazy and no filter rules are expanded.
+
+Assisted-by: Codex:GPT-6
+Signed-off-by: gokwok <531504879@qq.com>
+---
+ docs/prewarm.md                       |  3 +++
+ virtio-devices/src/seccomp_filters.rs | 26 ++++++++++++++++++++++++++
+ vmm/src/lib.rs                        |  3 +++
+ 3 files changed, 32 insertions(+)
+
+diff --git a/docs/prewarm.md b/docs/prewarm.md
+index db50abea9..ffc931c57 100644
+--- a/docs/prewarm.md
++++ b/docs/prewarm.md
+@@ -9,3 +9,6 @@ ordinary constructor instead. Other hypervisor backends reject preparation.
+ Preparation is single-use. A repeated request is rejected. Delete discards
+ unused preparation; after a failed preparation, replace the VMM process.
+ These interfaces are proposed extensions, not upstream compatibility promises.
++
++Preparation also compiles the existing virtio seccomp filters before restore.
++Workers still install their own filters before running device code.
+diff --git a/virtio-devices/src/seccomp_filters.rs b/virtio-devices/src/seccomp_filters.rs
+index 2656651c5..ccae1aa9c 100644
+--- a/virtio-devices/src/seccomp_filters.rs
++++ b/virtio-devices/src/seccomp_filters.rs
+@@ -460,6 +460,32 @@ pub fn get_seccomp_filter(action: &SeccompAction, thread: Thread) -> Result<BpfP
+     get_cached_seccomp_filter(action, thread).map(|program| program.as_ref().clone())
+ }
+ 
++/// Compile device filters before binding any guest resources.
++pub fn precompile_seccomp_filters(action: &SeccompAction) -> Result<(), Error> {
++    for kind in [
++        Thread::VirtioBalloon,
++        Thread::VirtioBlock,
++        Thread::VirtioConsole,
++        Thread::VirtioIommu,
++        Thread::VirtioMem,
++        Thread::VirtioNet,
++        Thread::VirtioNetCtl,
++        Thread::VirtioPmem,
++        Thread::VirtioRng,
++        Thread::VirtioRtc,
++        Thread::VirtioVhostBlock,
++        Thread::VirtioVhostFs,
++        Thread::VirtioGenericVhostUser,
++        Thread::VirtioVhostNet,
++        Thread::VirtioVhostNetCtl,
++        Thread::VirtioVsock,
++        Thread::VirtioWatchdog,
++    ] {
++        get_cached_seccomp_filter(action, kind)?;
++    }
++    Ok(())
++}
++
+ #[cfg(test)]
+ mod cache_tests {
+     use super::*;
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 6e25d265b..22f600aca 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -36,6 +36,7 @@
+ use signal_hook::iterator::{Handle, Signals};
+ use thiserror::Error;
+ use tracer::trace_scoped;
++use virtio_devices::seccomp_filters::precompile_seccomp_filters;
+ use vm_memory::bitmap::AtomicBitmap;
+ use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
+ use vm_migration::protocol::*;
+@@ -2824,6 +2825,8 @@ fn vmm_prepare(&mut self, _config: prewarm::PrepareConfig) -> result::Result<Vec
+                 "Backend does not support preparation"
+             )));
+         }
++        precompile_seccomp_filters(&self.seccomp_action)
++            .map_err(|error| VmError::Prepare(error.into()))?;
+         self.precreated_vm = Some(Vm::create_hypervisor_vm(
+             self.hypervisor.as_ref(),
+             hypervisor::HypervisorVmConfig::default(),

@@ -1,0 +1,72 @@
+--- a/cmd/sandbox-init/vsock.go
++++ b/cmd/sandbox-init/vsock.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"sync"
+ 	"syscall"
+ 	"time"
+@@ -48,7 +49,16 @@
+ }
+ 
+ func (c *vsockConn) Read(b []byte) (int, error) {
+-	return retryInterruptedIO(syscall.Read, c.fd, b)
++	if len(b) == 0 {
++		return 0, nil
++	}
++	n, err := retryInterruptedIO(syscall.Read, c.fd, b)
++	// read(2) reports a closed stream as zero bytes without errno. io.Reader
++	// requires EOF here so ReadFull and the control/MUX loops stop retrying.
++	if n == 0 && err == nil {
++		return 0, io.EOF
++	}
++	return n, err
+ }
+ 
+ func (c *vsockConn) Write(b []byte) (int, error) {
+--- a/cmd/sandbox-init/vsock_test.go
++++ b/cmd/sandbox-init/vsock_test.go
+@@ -2,11 +2,41 @@
+ 
+ import (
+ 	"errors"
++	"io"
+ 	"syscall"
+ 	"testing"
+ 
+ 	"golang.org/x/sys/unix"
+ )
++
++// A stream EOF must reach io.ReadFull. Returning (0, nil) for a non-empty
++// buffer makes the protocol/MUX readers spin after the host closes a socket.
++func TestVsockConnReportsPeerEOF(t *testing.T) {
++	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	c := &vsockConn{fd: pair[0]}
++	t.Cleanup(func() { _ = c.Close() })
++	if _, err := unix.Write(pair[1], []byte("abc")); err != nil {
++		_ = unix.Close(pair[1])
++		t.Fatal(err)
++	}
++	_ = unix.Close(pair[1])
++	buf := make([]byte, 4)
++	if n, err := c.Read(buf[:3]); n != 3 || err != nil || string(buf[:3]) != "abc" {
++		t.Fatalf("buffered bytes: n=%d err=%v data=%q", n, err, buf[:3])
++	}
++	if n, err := c.Read(buf); n != 0 || err != io.EOF {
++		t.Fatalf("peer EOF: got (%d, %v), want (0, io.EOF)", n, err)
++	}
++	if n, err := c.Read(nil); n != 0 || err != nil {
++		t.Fatalf("empty read: got (%d, %v), want (0, nil)", n, err)
++	}
++	if n, err := io.ReadFull(c, buf); n != 0 || err != io.EOF {
++		t.Fatalf("protocol reader: got (%d, %v), want (0, io.EOF)", n, err)
++	}
++}
+ 
+ func TestRetryInterruptedIO(t *testing.T) {
+ 	calls := 0

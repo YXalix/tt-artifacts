@@ -1,0 +1,135 @@
+From 4b5f34137a384044a4958e36056687d42ea05bf3 Mon Sep 17 00:00:00 2001
+From: gokwok <531504879@qq.com>
+Date: Tue, 8 Sep 2026 17:09:45 +0800
+Subject: [PATCH] virtio-devices: Cache compiled device seccomp programs
+
+Reuse immutable BPF programs keyed by thread type and seccomp action.
+Keep filter rules and per-worker installation unchanged. Bound the
+cache because actions can contain arbitrary errno values.
+Compare cached programs against the existing compiler in a unit test.
+
+Assisted-by: Codex:GPT-6
+Signed-off-by: gokwok <531504879@qq.com>
+---
+ virtio-devices/src/seccomp_filters.rs | 67 ++++++++++++++++++++++++++-
+ virtio-devices/src/thread_helper.rs   |  4 +-
+ 2 files changed, 67 insertions(+), 4 deletions(-)
+
+diff --git a/virtio-devices/src/seccomp_filters.rs b/virtio-devices/src/seccomp_filters.rs
+index 7f87f9a82..2656651c5 100644
+--- a/virtio-devices/src/seccomp_filters.rs
++++ b/virtio-devices/src/seccomp_filters.rs
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use std::env;
++use std::sync::{Arc, Mutex, OnceLock};
+ 
+ use block::{BLKDISCARD, BLKZEROOUT};
+ use libc::{FIONBIO, TIOCGWINSZ, TUNSETOFFLOAD};
+@@ -14,7 +15,7 @@
+     SeccompFilter, SeccompRule,
+ };
+ 
+-#[derive(Clone, Copy)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Thread {
+     VirtioBalloon,
+     VirtioBlock,
+@@ -402,7 +403,7 @@ fn virtio_thread_common() -> Vec<(i64, Vec<SeccompRule>)> {
+ }
+ 
+ /// Generate a BPF program based on the seccomp_action value
+-pub fn get_seccomp_filter(
++fn build_seccomp_filter(
+     seccomp_action: &SeccompAction,
+     thread_type: Thread,
+ ) -> Result<BpfProgram, Error> {
+@@ -418,3 +419,65 @@ pub fn get_seccomp_filter(
+         .map_err(Error::Backend),
+     }
+ }
++
++struct CachedFilter {
++    action: SeccompAction,
++    thread: Thread,
++    program: Arc<BpfProgram>,
++}
++
++static FILTER_CACHE: OnceLock<Mutex<Vec<CachedFilter>>> = OnceLock::new();
++
++pub(crate) fn get_cached_seccomp_filter(
++    action: &SeccompAction,
++    thread: Thread,
++) -> Result<Arc<BpfProgram>, Error> {
++    let mut cache = FILTER_CACHE
++        .get_or_init(|| Mutex::new(Vec::new()))
++        .lock()
++        .unwrap();
++    if let Some(entry) = cache
++        .iter()
++        .find(|entry| entry.action == *action && entry.thread == thread)
++    {
++        return Ok(entry.program.clone());
++    }
++    let program = Arc::new(build_seccomp_filter(action, thread)?);
++    // Actions may contain caller-supplied errno values. Bound cache growth
++    // without evicting programs already borrowed by device workers.
++    if cache.len() < 64 {
++        cache.push(CachedFilter {
++            action: action.clone(),
++            thread,
++            program: program.clone(),
++        });
++    }
++    Ok(program)
++}
++
++/// Generate a device filter, reusing an immutable compiled program when possible.
++pub fn get_seccomp_filter(action: &SeccompAction, thread: Thread) -> Result<BpfProgram, Error> {
++    get_cached_seccomp_filter(action, thread).map(|program| program.as_ref().clone())
++}
++
++#[cfg(test)]
++mod cache_tests {
++    use super::*;
++
++    #[test]
++    fn cached_program_preserves_compiler_output_and_action() {
++        for action in [SeccompAction::Trap, SeccompAction::Allow] {
++            let first = get_cached_seccomp_filter(&action, Thread::VirtioVsock).unwrap();
++            let second = get_cached_seccomp_filter(&action, Thread::VirtioVsock).unwrap();
++            assert!(Arc::ptr_eq(&first, &second));
++            let expected = build_seccomp_filter(&action, Thread::VirtioVsock).unwrap();
++            assert_eq!(first.len(), expected.len());
++            for (actual, expected) in first.iter().zip(&expected) {
++                assert_eq!(
++                    (actual.code, actual.jt, actual.jf, actual.k),
++                    (expected.code, expected.jt, expected.jf, expected.k)
++                );
++            }
++        }
++    }
++}
+diff --git a/virtio-devices/src/thread_helper.rs b/virtio-devices/src/thread_helper.rs
+index 8a183d397..1cad99dd6 100644
+--- a/virtio-devices/src/thread_helper.rs
++++ b/virtio-devices/src/thread_helper.rs
+@@ -14,7 +14,7 @@
+ use vmm_sys_util::eventfd::EventFd;
+ 
+ use crate::epoll_helper::EpollHelperError;
+-use crate::seccomp_filters::{Thread, get_seccomp_filter};
++use crate::seccomp_filters::{Thread, get_cached_seccomp_filter};
+ use crate::{ActivateError, VirtioInterrupt, mark_device_needs_reset};
+ 
+ #[expect(clippy::too_many_arguments)]
+@@ -32,7 +32,7 @@ pub(crate) fn spawn_virtio_thread<F>(
+     F: FnOnce() -> result::Result<(), EpollHelperError>,
+     F: Send + 'static,
+ {
+-    let seccomp_filter = get_seccomp_filter(seccomp_action, thread_type)
++    let seccomp_filter = get_cached_seccomp_filter(seccomp_action, thread_type)
+         .map_err(ActivateError::CreateSeccompFilter)?;
+ 
+     let thread_exit_evt = exit_evt.try_clone().map_err(ActivateError::CloneEventFd)?;

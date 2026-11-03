@@ -1,0 +1,387 @@
+From feb39b3988f38f88a3bad07a292c570ee57a15ac Mon Sep 17 00:00:00 2001
+From: gokwok <531504879@qq.com>
+Date: Tue, 8 Sep 2026 23:05:07 +0800
+Subject: [PATCH] vmm: Prepare an empty KVM VM on explicit request
+
+Add vmm.prepare for idle VMMs and transfer the empty VM into restore.
+Do not change ordinary VMM startup or prepare confidential VM types.
+Delete drops idle resources; other backends retain ordinary creation.
+This is an experimental API requiring upstream lifecycle review.
+
+Match the KVM VM type rather than unrelated nested/SMT/RAM fields.
+
+Assisted-by: Codex:GPT-6
+Signed-off-by: gokwok <531504879@qq.com>
+---
+ docs/prewarm.md                           | 11 ++++
+ vmm/src/api/http/http_endpoint.rs         |  1 +
+ vmm/src/api/http/mod.rs                   |  6 +-
+ vmm/src/api/mod.rs                        | 39 ++++++++++++
+ vmm/src/api/openapi/cloud-hypervisor.yaml | 17 +++++
+ vmm/src/lib.rs                            | 24 +++++++
+ vmm/src/prewarm.rs                        | 76 +++++++++++++++++++++++
+ vmm/src/vm.rs                             | 10 ++-
+ 8 files changed, 182 insertions(+), 2 deletions(-)
+ create mode 100644 docs/prewarm.md
+ create mode 100644 vmm/src/prewarm.rs
+
+diff --git a/docs/prewarm.md b/docs/prewarm.md
+new file mode 100644
+index 000000000..db50abea9
+--- /dev/null
++++ b/docs/prewarm.md
+@@ -0,0 +1,11 @@
++# Idle VMM preparation
++
++Preparation is optional. Starting a VMM and the ordinary create/restore APIs
++retain their existing behavior. `PUT /api/v1/vmm.prepare` with `{}` creates
++an empty default KVM VM without guest memory, devices or guest execution.
++A subsequent ordinary restore consumes it. Confidential VM types use the
++ordinary constructor instead. Other hypervisor backends reject preparation.
++
++Preparation is single-use. A repeated request is rejected. Delete discards
++unused preparation; after a failed preparation, replace the VMM process.
++These interfaces are proposed extensions, not upstream compatibility promises.
+diff --git a/vmm/src/api/http/http_endpoint.rs b/vmm/src/api/http/http_endpoint.rs
+index c50c56ce4..781169fed 100644
+--- a/vmm/src/api/http/http_endpoint.rs
++++ b/vmm/src/api/http/http_endpoint.rs
+@@ -462,6 +462,7 @@ impl GetHandler for $action {}
+     };
+ }
+ 
++vm_action_put_handler_body!(api::VmmPrepare);
+ vm_action_get_handler!(VmCounters);
+ 
+ vm_action_put_handler!(VmBoot);
+diff --git a/vmm/src/api/http/mod.rs b/vmm/src/api/http/mod.rs
+index 59fd2d654..df56ad319 100644
+--- a/vmm/src/api/http/mod.rs
++++ b/vmm/src/api/http/mod.rs
+@@ -31,7 +31,7 @@
+     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
+     VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmNmi,
+     VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
+-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
++    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmmPrepare,
+ };
+ use crate::config::ValidationError;
+ use crate::device_manager::DeviceManagerError;
+@@ -330,6 +330,10 @@ macro_rules! endpoint {
+     r.routes
+         .insert(endpoint!("/vm.nmi"), Box::new(VmActionHandler::new(&VmNmi)));
+ 
++    r.routes.insert(
++        endpoint!("/vmm.prepare"),
++        Box::new(VmActionHandler::new(&VmmPrepare)),
++    );
+     r
+ });
+ 
+diff --git a/vmm/src/api/mod.rs b/vmm/src/api/mod.rs
+index d3ee6974f..d4caaa722 100644
+--- a/vmm/src/api/mod.rs
++++ b/vmm/src/api/mod.rs
+@@ -61,6 +61,7 @@
+ use crate::migration::transport::{
+     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
+ };
++use crate::prewarm::PrepareConfig;
+ use crate::vm::{Error as VmError, VmState};
+ use crate::vm_config::{
+     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
+@@ -70,6 +71,9 @@
+ /// API errors are sent back from the VMM API server through the ApiResponse.
+ #[derive(Error, Debug)]
+ pub enum ApiError {
++    /// Idle resource preparation failed.
++    #[error("Error preparing VMM")]
++    VmmPrepare(#[source] VmError),
+     /// Cannot write to EventFd.
+     #[error("Cannot write to EventFd")]
+     EventFdWrite(#[source] io::Error),
+@@ -882,6 +886,11 @@ pub trait RequestHandler {
+ 
+     fn vm_balloon_stats(&self) -> Result<BalloonStatsResponse, VmError>;
+ 
++    fn vmm_prepare(&mut self, _config: PrepareConfig) -> Result<Vec<u8>, VmError> {
++        Err(VmError::Prepare(anyhow::anyhow!(
++            "Preparation is unsupported"
++        )))
++    }
+     fn vmm_ping(&self) -> VmmPingResponse;
+ 
+     fn vm_delete(&mut self) -> Result<(), VmError>;
+@@ -2147,6 +2156,36 @@ fn send(
+     }
+ }
+ 
++pub struct VmmPrepare;
++impl ApiAction for VmmPrepare {
++    type RequestBody = PrepareConfig;
++    type ResponseBody = Option<Body>;
++    fn request(
++        &self,
++        config: Self::RequestBody,
++        response_sender: Sender<ApiResponse>,
++    ) -> ApiRequest {
++        Box::new(move |vmm| {
++            let response = vmm
++                .vmm_prepare(config)
++                .map(|body| ApiResponsePayload::VmAction(Some(body)))
++                .map_err(ApiError::VmmPrepare);
++            response_sender
++                .send(response)
++                .map_err(VmmError::ApiResponseSend)?;
++            Ok(false)
++        })
++    }
++    fn send(
++        &self,
++        api_evt: EventFd,
++        api_sender: Sender<ApiRequest>,
++        data: Self::RequestBody,
++    ) -> ApiResult<Self::ResponseBody> {
++        get_response_body(self, api_evt, api_sender, data)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::path::PathBuf;
+diff --git a/vmm/src/api/openapi/cloud-hypervisor.yaml b/vmm/src/api/openapi/cloud-hypervisor.yaml
+index d63491de4..6bc51490e 100644
+--- a/vmm/src/api/openapi/cloud-hypervisor.yaml
++++ b/vmm/src/api/openapi/cloud-hypervisor.yaml
+@@ -11,6 +11,23 @@ servers:
+   - url: http://localhost/api/v1
+ 
+ paths:
++  /vmm.prepare:
++    put:
++      summary: Prepare resources in an idle VMM
++      operationId: prepareVMM
++      requestBody:
++        required: true
++        content:
++          application/json:
++            schema:
++              type: object
++              additionalProperties: false
++      responses:
++        '200':
++          description: Empty default KVM VM prepared
++        '500':
++          description: Preparation failed
++
+   /vmm.ping:
+     get:
+       summary: Ping the VMM to check for API server availability
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 7075603f0..6e25d265b 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -95,6 +95,7 @@
+ pub mod memory_manager;
+ pub mod migration;
+ mod pci_segment;
++pub mod prewarm;
+ pub mod seccomp_filters;
+ mod serial_manager;
+ #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+@@ -709,6 +710,7 @@ pub struct Vmm {
+     vm_config: Option<Arc<Mutex<VmConfig>>>,
+     seccomp_action: SeccompAction,
+     hypervisor: Arc<dyn hypervisor::Hypervisor>,
++    precreated_vm: Option<Arc<dyn hypervisor::Vm>>,
+     activate_evt: EventFd,
+     signals: Option<Handle>,
+     threads: Vec<thread::JoinHandle<()>>,
+@@ -942,6 +944,7 @@ fn new(
+             vm_config: None,
+             seccomp_action,
+             hypervisor,
++            precreated_vm: None,
+             activate_evt,
+             signals: None,
+             threads: vec![],
+@@ -2094,6 +2097,7 @@ fn vm_restore(
+                     Some(source_url),
+                     Some(prefault),
+                     Some(memory_restore_mode),
++                    self.precreated_vm.take(),
+                 )?;
+ 
+                 if self
+@@ -2507,6 +2511,7 @@ fn vm_boot(&mut self) -> result::Result<(), VmError> {
+                             None,
+                             None,
+                             None,
++                            None,
+                         )?;
+ 
+                         let r = vm.boot();
+@@ -2743,6 +2748,7 @@ fn vm_reboot(&mut self) -> result::Result<(), VmError> {
+             None,
+             None,
+             None,
++            None,
+         )?;
+ 
+         // And we boot it
+@@ -2809,6 +2815,23 @@ fn vm_balloon_stats(&self) -> result::Result<BalloonStatsResponse, VmError> {
+         }
+     }
+ 
++    fn vmm_prepare(&mut self, _config: prewarm::PrepareConfig) -> result::Result<Vec<u8>, VmError> {
++        if self.vm_config.is_some() || self.precreated_vm.is_some() {
++            return Err(VmError::Prepare(anyhow!("VMM is not unprepared and idle")));
++        }
++        if !prewarm::supported(self.hypervisor.as_ref()) {
++            return Err(VmError::Prepare(anyhow!(
++                "Backend does not support preparation"
++            )));
++        }
++        self.precreated_vm = Some(Vm::create_hypervisor_vm(
++            self.hypervisor.as_ref(),
++            hypervisor::HypervisorVmConfig::default(),
++        )?);
++        serde_json::to_vec(&prewarm::PrepareResponse { vm: true })
++            .map_err(|error| VmError::Prepare(error.into()))
++    }
++
+     fn vmm_ping(&self) -> VmmPingResponse {
+         let VmmVersionInfo {
+             build_version,
+@@ -2824,6 +2847,7 @@ fn vmm_ping(&self) -> VmmPingResponse {
+     }
+ 
+     fn vm_delete(&mut self) -> result::Result<(), VmError> {
++        self.precreated_vm = None;
+         if self.vm_config.is_none() {
+             return Ok(());
+         }
+diff --git a/vmm/src/prewarm.rs b/vmm/src/prewarm.rs
+new file mode 100644
+index 000000000..bfccdbd9b
+--- /dev/null
++++ b/vmm/src/prewarm.rs
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: Apache-2.0
++//! Optional resources owned by an idle VMM and consumed by one restore.
++
++use serde::{Deserialize, Serialize};
++
++/// KVM's ordinary VM type is independent of RAM size, nested policy and SMT.
++/// Those fields affect later initialization or other backends, not create_vm.
++pub(crate) fn compatible_vm_type(_config: &hypervisor::HypervisorVmConfig) -> bool {
++    #[cfg(feature = "tdx")]
++    if _config.tdx_enabled {
++        return false;
++    }
++    #[cfg(feature = "sev_snp")]
++    if _config.sev_snp_enabled {
++        return false;
++    }
++    true
++}
++
++#[cfg(test)]
++mod vm_type_tests {
++    use super::*;
++    #[test]
++    fn ordinary_cpu_policy_does_not_change_kvm_vm_type() {
++        let mut config = hypervisor::HypervisorVmConfig {
++            #[cfg(feature = "tdx")]
++            tdx_enabled: false,
++            #[cfg(feature = "sev_snp")]
++            sev_snp_enabled: false,
++            #[cfg(feature = "sev_snp")]
++            mem_size: 256 * 1024 * 1024,
++            #[cfg(feature = "sev_snp")]
++            vmsa_features: 0,
++            nested: false,
++            smt_enabled: false,
++        };
++        config.nested = true;
++        config.smt_enabled = true;
++        assert!(compatible_vm_type(&config));
++        #[cfg(feature = "tdx")]
++        {
++            config.tdx_enabled = true;
++            assert!(!compatible_vm_type(&config));
++            config.tdx_enabled = false;
++        }
++        #[cfg(feature = "sev_snp")]
++        {
++            config.mem_size = 256 * 1024 * 1024;
++            assert!(compatible_vm_type(&config));
++            config.sev_snp_enabled = true;
++            assert!(!compatible_vm_type(&config));
++        }
++    }
++}
++
++#[derive(Clone, Debug, Default, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct PrepareConfig {}
++
++#[derive(Serialize)]
++pub struct PrepareResponse {
++    pub vm: bool,
++}
++
++/// Preparation is limited to the KVM architectures with descriptor support.
++pub fn supported(hypervisor: &dyn hypervisor::Hypervisor) -> bool {
++    #[cfg(all(feature = "kvm", any(target_arch = "x86_64", target_arch = "aarch64")))]
++    {
++        hypervisor.hypervisor_type() == hypervisor::HypervisorType::Kvm
++    }
++    #[cfg(not(all(feature = "kvm", any(target_arch = "x86_64", target_arch = "aarch64"))))]
++    {
++        let _ = hypervisor;
++        false
++    }
++}
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index c83fb6950..261c311b6 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -108,6 +108,7 @@
+ #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+ use crate::migration::url_to_file;
+ use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapshot, url_to_path};
++use crate::prewarm::compatible_vm_type;
+ #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+ use crate::sev::MeasuredBootInfo;
+ #[cfg(feature = "fw_cfg")]
+@@ -124,6 +125,9 @@
+ /// Errors associated with VM management
+ #[derive(Debug, Error)]
+ pub enum Error {
++    /// Idle resource preparation failed.
++    #[error("Error preparing idle VMM")]
++    Prepare(#[source] anyhow::Error),
+     #[error("Cannot open kernel file")]
+     KernelFile(#[source] io::Error),
+ 
+@@ -1352,6 +1356,7 @@ pub fn new(
+         source_url: Option<&str>,
+         prefault: Option<bool>,
+         memory_restore_mode: Option<MemoryRestoreMode>,
++        precreated_vm: Option<Arc<dyn hypervisor::Vm>>,
+     ) -> Result<Self> {
+         trace_scoped!("Vm::new");
+ 
+@@ -1385,7 +1390,10 @@ pub fn new(
+             if let Some(ref igvm) = igvm_file {
+                 hv_config.vmsa_features = igvm_loader::extract_sev_features(igvm);
+             }
+-            Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
++            match precreated_vm {
++                Some(vm) if compatible_vm_type(&hv_config) => vm,
++                _ => Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?,
++            }
+         };
+ 
+         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]

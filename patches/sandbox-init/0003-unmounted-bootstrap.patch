@@ -1,0 +1,141 @@
+--- a/cmd/sandbox-init/main.go
++++ b/cmd/sandbox-init/main.go
+@@ -103,6 +103,11 @@
+ 	revFD, err := bindVsockListener(proto.LaunchPort)
+ 	if err != nil {
+ 		die("vsock listen: %v", err)
++	}
++
++	// Optional reusable kernel baseline, before any workload state is received.
++	if err := bootstrapGate(revFD); err != nil {
++		die("bootstrap gate: %v", err)
+ 	}
+ 
+ 	// Launch handshake (dial → hello → recv launch) runs in a goroutine
+--- /dev/null
++++ b/cmd/sandbox-init/bootstrap.go
+@@ -0,0 +1,113 @@
++package main
++
++import (
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"os"
++	"strings"
++	"time"
++
++	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
++	"golang.org/x/sys/unix"
++)
++
++// bootstrapGate runs only for the host's blank-disk baseline builder. No
++// launch specification or business filesystem may be read before this gate.
++// The saved VM contains PID 1 and the kernel, never an application process.
++func bootstrapGate(listener int) error {
++	for _, m := range []struct{ source, target, kind string }{
++		{"proc", "/proc", "proc"}, {"sysfs", "/sys", "sysfs"}, {"devtmpfs", "/dev", "devtmpfs"},
++	} {
++		if err := unix.Mount(m.source, m.target, m.kind, 0, ""); err != nil && !errors.Is(err, unix.EBUSY) {
++			return fmt.Errorf("mount %s: %w", m.target, err)
++		}
++	}
++	cmdline, err := os.ReadFile("/proc/cmdline")
++	if err != nil {
++		return err
++	}
++	if !strings.Contains(" "+strings.TrimSpace(string(cmdline))+" ", " sandbox.bootstrap.gate=1 ") {
++		return nil
++	}
++	for _, device := range []string{"/dev/vda", "/dev/vdb"} {
++		if err := waitForDevice(device, devicePollTimeout); err != nil {
++			return err
++		}
++	}
++	conn, err := dialVsock(proto.VsockHostCID, proto.LaunchPort)
++	if err != nil {
++		return err
++	}
++	if err = proto.WriteMessage(conn, &proto.Message{Type: "bootstrap_ready"}); err == nil {
++		var reply *proto.Message
++		reply, err = proto.ReadMessage(conn)
++		if err == nil && reply.Type != "bootstrap_wait" {
++			err = fmt.Errorf("unexpected bootstrap reply %q", reply.Type)
++		}
++	}
++	_ = conn.Close()
++	if err != nil {
++		return err
++	}
++	// Close the notification before blocking in accept: no live peer connection
++	// is captured. A restore injects its clock and then mounts the current disks.
++	for {
++		fd, _, err := unix.Accept(listener)
++		if errors.Is(err, unix.EINTR) {
++			continue
++		}
++		if err != nil {
++			return err
++		}
++		control := &vsockConn{fd: fd}
++		_ = control.SetDeadline(time.Now().Add(30 * time.Second))
++		err = resumeBootstrap(control)
++		_ = control.Close()
++		return err
++	}
++}
++
++func resumeBootstrap(conn *vsockConn) error {
++	req, err := proto.ReadMessage(conn)
++	if err != nil {
++		return err
++	}
++	if req.Type != "bootstrap_resume" || req.WallclockNs <= 0 {
++		return fmt.Errorf("invalid bootstrap resume")
++	}
++	seed, err := hex.DecodeString(req.BootstrapSeed)
++	if err != nil || len(seed) != 32 {
++		return fmt.Errorf("invalid bootstrap entropy")
++	}
++	random, err := os.OpenFile("/dev/urandom", os.O_WRONLY, 0)
++	if err != nil {
++		return err
++	}
++	_, err = random.Write(seed)
++	if err == nil {
++		err = unix.IoctlSetInt(int(random.Fd()), unix.RNDRESEEDCRNG, 0)
++	}
++	_ = random.Close()
++	if err != nil {
++		return fmt.Errorf("reseed bootstrap random generator: %w", err)
++	}
++	ts := unix.NsecToTimespec(req.WallclockNs)
++	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &ts); err != nil {
++		return err
++	}
++	// Linux may probe the blank disks during enumeration. Drop their raw block
++	// cache before mounting a replacement. Neither filesystem has been mounted.
++	for _, device := range []string{"/dev/vda", "/dev/vdb"} {
++		fd, err := unix.Open(device, unix.O_RDONLY|unix.O_CLOEXEC, 0)
++		if err != nil {
++			return err
++		}
++		err = unix.IoctlSetInt(fd, unix.BLKFLSBUF, 0)
++		_ = unix.Close(fd)
++		if err != nil {
++			return fmt.Errorf("invalidate %s: %w", device, err)
++		}
++	}
++	return proto.WriteMessage(conn, &proto.Message{Type: "bootstrap_ack"})
++}
+--- a/pkg/proto/proto.go
++++ b/pkg/proto/proto.go
+@@ -370,6 +370,8 @@
+ 	// dormant interval; the guest jumps CLOCK_REALTIME to this on
+ 	// restore. Unset (0) on attach — a live VM's clock is fine.
+ 	WallclockNs int64 `json:"wallclock_ns,omitempty"`
++	// Fresh host entropy for clones of the unmounted bootstrap baseline.
++	BootstrapSeed string `json:"bootstrap_seed,omitempty"`
+ 
+ 	// restore: optional new guest IP-layer config. When set, the guest
+ 	// re-applies it flush-and-replace before thawing, so a clone restored

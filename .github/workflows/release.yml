@@ -1,0 +1,48 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tt-artifacts-*
+          merge-multiple: false
+
+      - name: Package release archives
+        run: |
+          set -euxo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p release-out
+          for d in tt-artifacts-*/; do
+            arch="${d#tt-artifacts-}"; arch="${arch%/}"
+            tar -czf "release-out/tt-artifacts-${arch}-${tag}.tar.gz" "${d%/}"
+          done
+          (
+            cd tt-artifacts-x86_64  && sha256sum --check SHA256SUMS >/dev/null
+            cd ../tt-artifacts-aarch64 && sha256sum --check SHA256SUMS >/dev/null
+          )
+          sha256sum release-out/*.tar.gz > release-out/SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "tt-artifacts ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            release-out/*

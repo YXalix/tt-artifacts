@@ -1,0 +1,48 @@
+From 3584d2799018dce78c134f055284e7e08da65beb Mon Sep 17 00:00:00 2001
+From: gokwok <531504879@qq.com>
+Date: Wed, 9 Sep 2026 17:12:36 +0800
+Subject: [PATCH] vmm: Query block capacity for copy-on-write restore
+
+Use the existing block helper for snapshot backing capacity. Block devices can report zero metadata length even when their capacity covers every saved range. Keep the existing lower-bound check and mapping behavior.
+
+Signed-off-by: gokwok <531504879@qq.com>
+---
+ docs/snapshot_restore.md  | 6 ++++--
+ vmm/src/memory_manager.rs | 4 +++-
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/docs/snapshot_restore.md b/docs/snapshot_restore.md
+index 9a26604f07..19e8de5242 100644
+--- a/docs/snapshot_restore.md
++++ b/docs/snapshot_restore.md
+@@ -161,8 +161,10 @@ Current constraints for `memory_restore_mode=copyonwrite`:
+   (`--device`/`--user-device`/`--vdpa`), and snapshot ranges that are not
+   page-aligned single-region extents. Each region's `reserve` policy and the
+   THP policy are re-applied to the mapped region.
+-- A snapshot memory file shorter than the saved ranges is rejected up front (it
+-  would otherwise fault `SIGBUS` at run time).
++- A snapshot memory file or block device shorter than the saved ranges is
++  rejected up front (it would otherwise fault `SIGBUS` at run time). The existing
++  block helper queries device capacity instead of relying on the zero file size
++  reported for block devices. The saved-range capacity lower bound is unchanged.
+ - `prefault` is rejected.
+ - The snapshot memory file must remain on disk **and unchanged** for the
+   entire lifetime of the VM. This is stronger than `ondemand`: UFFD copies each
+diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
+index 063748749a..03efc9f35b 100644
+--- a/vmm/src/memory_manager.rs
++++ b/vmm/src/memory_manager.rs
+@@ -946,7 +946,9 @@ fn mmap_cow_saved_regions(
+             .map_err(Error::SnapshotOpen)?;
+         // A range mapped past EOF faults SIGBUS at run time, not restore time.
+         let mapped_len: u64 = saved_regions.regions().iter().map(|r| r.length).sum();
+-        let file_len = memory_file.metadata().map_err(Error::SnapshotOpen)?.len();
++        let file_len = block::query_device_size(&memory_file)
++            .map_err(Error::SnapshotOpen)?
++            .0;
+         if file_len < mapped_len {
+             return Err(Error::SnapshotMmap(io::Error::new(
+                 io::ErrorKind::UnexpectedEof,
+-- 
+2.43.0
+

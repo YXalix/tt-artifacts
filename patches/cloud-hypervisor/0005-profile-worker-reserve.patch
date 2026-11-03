@@ -1,0 +1,1396 @@
+From 50384306c51a08ddffe04dbc53491ea9f990a3f9 Mon Sep 17 00:00:00 2001
+From: gokwok <531504879@qq.com>
+Date: Wed, 9 Sep 2026 06:39:25 +0800
+Subject: [PATCH] virtio-devices: Reserve workers through activation context
+
+Keep bounded one-shot workers in the profile prewarm VM-owned profile. Transfer the
+ordinary seccomp and error wrapper at first activation without adding
+a device trait setter. Preserve worker cleanup and fall back for changed
+thread context, Landlock, reset and hotplug.
+
+Assisted-by: Codex:GPT-6
+Signed-off-by: gokwok <531504879@qq.com>
+---
+ docs/prewarm.md                               |  30 +-
+ virtio-devices/src/balloon.rs                 |   4 +-
+ virtio-devices/src/block.rs                   |   4 +-
+ virtio-devices/src/console.rs                 |   4 +-
+ virtio-devices/src/device.rs                  |  12 +-
+ virtio-devices/src/iommu.rs                   |   3 +-
+ virtio-devices/src/lib.rs                     |   1 +
+ virtio-devices/src/mem.rs                     |   3 +-
+ virtio-devices/src/net.rs                     |   4 +-
+ virtio-devices/src/pmem.rs                    |   4 +-
+ virtio-devices/src/prepared.rs                | 270 ++++++++++++++++++
+ virtio-devices/src/rng.rs                     |   4 +-
+ virtio-devices/src/rtc.rs                     |   3 +-
+ virtio-devices/src/thread_helper.rs           |  50 ++--
+ virtio-devices/src/transport/pci_device.rs    |  10 +
+ virtio-devices/src/vdpa.rs                    |   1 +
+ virtio-devices/src/vhost_user/blk.rs          |   3 +-
+ virtio-devices/src/vhost_user/fs.rs           |   3 +-
+ .../src/vhost_user/generic_vhost_user.rs      |   3 +-
+ virtio-devices/src/vhost_user/net.rs          |   3 +-
+ virtio-devices/src/vsock/device.rs            |   6 +-
+ virtio-devices/src/watchdog.rs                |   3 +-
+ vmm/src/api/openapi/cloud-hypervisor.yaml     |  46 ++-
+ vmm/src/device_manager.rs                     |   9 +
+ vmm/src/lib.rs                                |  16 +-
+ vmm/src/prewarm.rs                            | 131 ++++++++-
+ vmm/src/seccomp_filters.rs                    |   2 +
+ vmm/src/vm.rs                                 |  24 +-
+ 28 files changed, 608 insertions(+), 48 deletions(-)
+ create mode 100644 virtio-devices/src/prepared.rs
+
+diff --git a/docs/prewarm.md b/docs/prewarm.md
+index 935c53896..581f9d998 100644
+--- a/docs/prewarm.md
++++ b/docs/prewarm.md
+@@ -18,8 +18,36 @@ Workers still install their own filters before running device code.
+ `vmm.prepare` accepts `vcpu_ids`, consecutive IDs starting at zero (at most
+ 256). KVM descriptor creation happens before restore; architectural state
+ initialization stays in the existing CPU restore path. Unused descriptors
+-are owned by the prepared VM and dropped with it. Empty IDs retain generic prewarm only.
++are owned by the prepared VM and dropped with it. Empty IDs with no device profile retain generic prewarm only.
+ 
+ Prepared vCPU IDs must match the actual restored boot CPU count and topology.
+ A mismatch is rejected before restoring state or preparing template memory;
+ unused reserved kernel vCPUs are never silently attached to a different VM.
++
++## Profile prewarm device workers
++
++A profile can also specify `block_queues` (one count per block device),
++`net_queues` (even RX/TX queue counts, excluding the control queue), `console`,
++`rng`, `pmem` (device count), `vsock`, and `balloon`. These capacity hints
++reserve at most 256 one-shot workers. Block devices use one worker per queue;
++network devices use one per queue pair plus one control worker. Each other
++listed device uses one worker. `workers` in the response is the reserved count.
++
++Workers wait without device or guest state. First activation transfers the
++ordinary seccomp and panic/error wrapper to a matching worker. No device
++trait extension is needed: resources flow through the transport's existing
++activation context to its worker collection. Exhaustion or a kind/seccomp
++mismatch uses ordinary allocation. Hotplug, reset and subsequent activation
++do not reuse the initial reserve. Unused workers are joined on delete or a
++failed preparation; consumed handles keep the normal device cleanup rules.
++
++Set process cgroups, NUMA policy, nice level and other inherited placement
++before preparation, and keep those settings stable for the prepared process.
++Do not individually reconfigure parked workers. Reuse is restricted to the
++creating VMM thread with unchanged affinity, signal mask and scheduler
++policy/priority; mismatches use ordinary thread creation. The VMM seccomp
++filter adds only read-only scheduler queries for this check. Device filters
++and the activation-time filter installation are unchanged.
++
++Restores with Landlock enabled discard device reservations and use ordinary
++allocation, so workers inherit restrictions at the normal activation point.
+diff --git a/virtio-devices/src/balloon.rs b/virtio-devices/src/balloon.rs
+index f2fda160c..132d93bd7 100644
+--- a/virtio-devices/src/balloon.rs
++++ b/virtio-devices/src/balloon.rs
+@@ -968,12 +968,14 @@ fn write_config(&mut self, offset: u64, data: &[u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources,
+             mem,
+             interrupt_cb,
+             mut queues,
+             device_status,
+         } = context;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common
++            .activate(&queues, interrupt_cb.clone(), resources)?;
+         *self.stats_cache.lock().unwrap() = None;
+         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+ 
+diff --git a/virtio-devices/src/block.rs b/virtio-devices/src/block.rs
+index 7aed4977c..ecbe218e2 100644
+--- a/virtio-devices/src/block.rs
++++ b/virtio-devices/src/block.rs
+@@ -1139,6 +1139,7 @@ fn write_config(&mut self, offset: u64, data: &[u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources,
+             mem,
+             interrupt_cb,
+             mut queues,
+@@ -1152,7 +1153,8 @@ fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         if original_acked_features != self.common.acked_features {
+             warn!("Guest did not acknowledge that device is read-only, acting as if it did!");
+         }
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common
++            .activate(&queues, interrupt_cb.clone(), resources)?;
+ 
+         // Recompute the barrier size from the queues that are actually activated.
+         self.common.paused_sync = Some(Arc::new(Barrier::new(queues.len() + 1)));
+diff --git a/virtio-devices/src/console.rs b/virtio-devices/src/console.rs
+index dec9de7f3..79cc6e2c6 100644
+--- a/virtio-devices/src/console.rs
++++ b/virtio-devices/src/console.rs
+@@ -715,12 +715,14 @@ fn read_config(&self, offset: u64, data: &mut [u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources,
+             mem,
+             interrupt_cb,
+             mut queues,
+             device_status,
+         } = context;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common
++            .activate(&queues, interrupt_cb.clone(), resources)?;
+         self.resizer
+             .acked_features
+             .store(self.common.acked_features, Ordering::Relaxed);
+diff --git a/virtio-devices/src/device.rs b/virtio-devices/src/device.rs
+index ce9345051..7018b76a6 100644
+--- a/virtio-devices/src/device.rs
++++ b/virtio-devices/src/device.rs
+@@ -26,6 +26,7 @@
+ use vmm_sys_util::eventfd::EventFd;
+ 
+ use crate::epoll_helper::EpollHelperError;
++use crate::prepared::DeviceResources;
+ use crate::seccomp_filters::Thread;
+ use crate::thread_helper::spawn_virtio_thread;
+ use crate::{
+@@ -66,6 +67,7 @@ pub struct VirtioSharedMemoryList {
+ }
+ 
+ pub struct ActivationContext {
++    pub resources: Option<Arc<DeviceResources>>,
+     pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
+     pub interrupt_cb: Arc<dyn VirtioInterrupt>,
+     pub queues: Vec<(u16, Queue, EventFd)>,
+@@ -220,6 +222,7 @@ pub trait DmaRemapping {
+ ///
+ /// Dropping signals every worker to exit, unparks any that are parked, and joins them.
+ pub struct WorkerThreads {
++    resources: Option<Arc<DeviceResources>>,
+     /// shared kill event, a single write wakes all of them.
+     kill_evt: EventFd,
+     // true if the device is paused.
+@@ -234,6 +237,7 @@ fn new(kill_evt: EventFd, paused: Arc<AtomicBool>) -> Self {
+             kill_evt,
+             paused,
+             threads: Vec::new(),
++            resources: None,
+         }
+     }
+ 
+@@ -309,6 +313,7 @@ pub fn activate(
+         &mut self,
+         queues: &[(u16, Queue, EventFd)],
+         interrupt_cb: Arc<dyn VirtioInterrupt>,
++        resources: Option<Arc<DeviceResources>>,
+     ) -> ActivateResult {
+         if queues.len() < self.min_queues.into() {
+             error!(
+@@ -338,7 +343,9 @@ pub fn activate(
+         })?;
+         // Create the worker collection up front so it owns the kill event;
+         // handlers clone it via dup_eventfds() before any worker is spawned.
+-        self.workers = Some(WorkerThreads::new(kill_evt, self.paused.clone()));
++        let mut workers = WorkerThreads::new(kill_evt, self.paused.clone());
++        workers.resources = resources;
++        self.workers = Some(workers);
+ 
+         let pause_evt = EventFd::new(EFD_NONBLOCK).map_err(|e| {
+             error!("failed creating pause EventFd: {e}");
+@@ -395,6 +402,7 @@ pub fn spawn_worker<F>(
+                 seccomp_action,
+                 thread_type,
+                 &mut workers.threads,
++                workers.resources.as_deref(),
+                 exit_evt,
+                 device_status,
+                 interrupt_cb,
+@@ -658,7 +666,7 @@ fn resume_preserves_sparse_queue_indices() {
+         ];
+         let mut common = VirtioCommon::default();
+ 
+-        common.activate(&queues, interrupt.clone()).unwrap();
++        common.activate(&queues, interrupt.clone(), None).unwrap();
+         common.resume().unwrap();
+ 
+         assert_eq!(queues[0].2.read().unwrap(), 1);
+diff --git a/virtio-devices/src/iommu.rs b/virtio-devices/src/iommu.rs
+index 415c34429..64dc99dce 100644
+--- a/virtio-devices/src/iommu.rs
++++ b/virtio-devices/src/iommu.rs
+@@ -1351,12 +1351,13 @@ fn write_config(&mut self, offset: u64, data: &[u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources: _,
+             mem,
+             interrupt_cb,
+             mut queues,
+             device_status,
+         } = context;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common.activate(&queues, interrupt_cb.clone(), None)?;
+         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+ 
+         let (_, request_queue, request_queue_evt) = queues.remove(0);
+diff --git a/virtio-devices/src/lib.rs b/virtio-devices/src/lib.rs
+index 109596a18..bd758e0bc 100644
+--- a/virtio-devices/src/lib.rs
++++ b/virtio-devices/src/lib.rs
+@@ -27,6 +27,7 @@
+ pub mod mem;
+ pub mod net;
+ mod pmem;
++pub mod prepared;
+ mod rng;
+ mod rtc;
+ pub mod seccomp_filters;
+diff --git a/virtio-devices/src/mem.rs b/virtio-devices/src/mem.rs
+index 3df39789f..83fa23617 100644
+--- a/virtio-devices/src/mem.rs
++++ b/virtio-devices/src/mem.rs
+@@ -945,12 +945,13 @@ fn read_config(&self, offset: u64, data: &mut [u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources: _,
+             mem,
+             interrupt_cb,
+             mut queues,
+             device_status,
+         } = context;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common.activate(&queues, interrupt_cb.clone(), None)?;
+         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+ 
+         let (_, queue, queue_evt) = queues.remove(0);
+diff --git a/virtio-devices/src/net.rs b/virtio-devices/src/net.rs
+index d0598dad8..d7c76f0e0 100644
+--- a/virtio-devices/src/net.rs
++++ b/virtio-devices/src/net.rs
+@@ -839,13 +839,15 @@ fn read_config(&self, offset: u64, data: &mut [u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources,
+             mem,
+             interrupt_cb,
+             mut queues,
+             device_status,
+         } = context;
+         self.device_status = device_status;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common
++            .activate(&queues, interrupt_cb.clone(), resources)?;
+ 
+         let num_queues = queues.len();
+         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
+diff --git a/virtio-devices/src/pmem.rs b/virtio-devices/src/pmem.rs
+index e9b3e82fb..b84d3907f 100644
+--- a/virtio-devices/src/pmem.rs
++++ b/virtio-devices/src/pmem.rs
+@@ -372,12 +372,14 @@ fn read_config(&self, offset: u64, data: &mut [u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources,
+             mem,
+             interrupt_cb,
+             mut queues,
+             device_status,
+         } = context;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common
++            .activate(&queues, interrupt_cb.clone(), resources)?;
+         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+         if let Some(disk) = self.disk.as_ref() {
+             let disk = disk.try_clone().map_err(|e| {
+diff --git a/virtio-devices/src/prepared.rs b/virtio-devices/src/prepared.rs
+new file mode 100644
+index 000000000..667e80d85
+--- /dev/null
++++ b/virtio-devices/src/prepared.rs
+@@ -0,0 +1,270 @@
++// SPDX-License-Identifier: Apache-2.0
++//! Bounded, single-use device resources with explicit VM ownership.
++
++use std::sync::{Mutex, mpsc};
++use std::thread::{self, JoinHandle};
++use std::{io, mem, ptr};
++
++use seccompiler::SeccompAction;
++
++use crate::seccomp_filters::Thread;
++
++pub struct DeviceResources {
++    workers: Mutex<Vec<PreparedWorker>>,
++    creator: thread::ThreadId,
++    environment: ThreadEnvironment,
++}
++
++// Thread creation inherits placement and signal/scheduler policy. Compare the
++// dispatching VMM context with the preparation context before reusing a worker.
++#[derive(PartialEq, Eq)]
++struct ThreadEnvironment {
++    affinity: Vec<u8>,
++    blocked_signals: u64,
++    policy: i32,
++    priority: i32,
++}
++
++impl ThreadEnvironment {
++    fn capture() -> io::Result<Self> {
++        let mut affinity = vec![0u8; 128];
++        loop {
++            // SAFETY: The kernel writes at most affinity.len() bytes to this
++            // live, writable buffer; the syscall accepts an unaligned bitmap.
++            let result = unsafe {
++                libc::syscall(
++                    libc::SYS_sched_getaffinity,
++                    0,
++                    affinity.len(),
++                    affinity.as_mut_ptr(),
++                )
++            };
++            if result >= 0 {
++                break;
++            }
++            let error = io::Error::last_os_error();
++            if error.raw_os_error() != Some(libc::EINVAL) || affinity.len() >= 8192 {
++                return Err(error);
++            }
++            affinity.resize(affinity.len() * 2, 0);
++        }
++        // SAFETY: Both output objects are initialized before use and pointers
++        // refer to live storage. A null new mask only queries the current mask.
++        let (blocked_signals, policy, priority) = unsafe {
++            let mut mask: libc::sigset_t = mem::zeroed();
++            let result = libc::pthread_sigmask(libc::SIG_SETMASK, ptr::null(), &mut mask);
++            if result != 0 {
++                return Err(io::Error::from_raw_os_error(result));
++            }
++            let mut blocked = 0;
++            for signal in 1..=64 {
++                if libc::sigismember(&mask, signal) == 1 {
++                    blocked |= 1u64 << (signal - 1);
++                }
++            }
++            let mut param: libc::sched_param = mem::zeroed();
++            let policy = libc::syscall(libc::SYS_sched_getscheduler, 0) as i32;
++            if policy < 0 || libc::syscall(libc::SYS_sched_getparam, 0, &mut param) < 0 {
++                return Err(io::Error::last_os_error());
++            }
++            (blocked, policy, param.sched_priority)
++        };
++        Ok(Self {
++            affinity,
++            blocked_signals,
++            policy,
++            priority,
++        })
++    }
++}
++
++type Job = Box<dyn FnOnce() + Send>;
++
++struct PreparedWorker {
++    kind: Thread,
++    action: SeccompAction,
++    sender: Option<mpsc::Sender<Job>>,
++    handle: Option<JoinHandle<()>>,
++}
++
++impl Drop for PreparedWorker {
++    fn drop(&mut self) {
++        // Closing the channel wakes an unused worker. Always join it, including
++        // when later thread creation fails partway through preparation.
++        self.sender.take();
++        if let Some(handle) = self.handle.take() {
++            let _ = handle.join();
++        }
++    }
++}
++
++impl DeviceResources {
++    pub fn new(action: &SeccompAction, kinds: &[Thread]) -> io::Result<Self> {
++        if kinds.len() > 256 {
++            return Err(io::Error::other("Worker reserve exceeds limit"));
++        }
++        let environment = ThreadEnvironment::capture()?;
++        let mut prepared = Vec::new();
++        for &kind in kinds {
++            let (sender, receiver) = mpsc::channel::<Job>();
++            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
++            let handle = thread::Builder::new()
++                .name(format!("{kind:?}"))
++                .spawn(move || {
++                    if ready_tx.send(()).is_ok()
++                        && let Ok(job) = receiver.recv()
++                    {
++                        job();
++                    }
++                })?;
++            let worker = PreparedWorker {
++                kind,
++                action: action.clone(),
++                sender: Some(sender),
++                handle: Some(handle),
++            };
++            ready_rx
++                .recv()
++                .map_err(|_| io::Error::other("Prepared worker exited"))?;
++            prepared.push(worker);
++        }
++        Ok(Self {
++            workers: Mutex::new(prepared),
++            creator: thread::current().id(),
++            environment,
++        })
++    }
++
++    pub(crate) fn spawn<F>(
++        &self,
++        name: &str,
++        kind: Thread,
++        action: &SeccompAction,
++        job: F,
++    ) -> io::Result<JoinHandle<()>>
++    where
++        F: FnOnce() + Send + 'static,
++    {
++        // Reuse only on the creating VMM thread; other activation contexts
++        // keep their normal thread inheritance and allocation path.
++        if thread::current().id() != self.creator
++            || ThreadEnvironment::capture().map_or(true, |current| current != self.environment)
++        {
++            return thread::Builder::new().name(name.to_owned()).spawn(job);
++        }
++        let worker = {
++            let mut workers = self.workers.lock().unwrap();
++            workers
++                .iter()
++                .position(|w| w.kind == kind && w.action == *action)
++                .map(|index| workers.remove(index))
++        };
++        if let Some(mut worker) = worker {
++            worker
++                .sender
++                .take()
++                .unwrap()
++                .send(Box::new(job))
++                .map_err(|_| io::Error::other("Prepared worker disconnected"))?;
++            Ok(worker.handle.take().unwrap())
++        } else {
++            thread::Builder::new().name(name.to_owned()).spawn(job)
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++
++    use super::*;
++    #[test]
++    fn unused_workers_join_and_dispatched_jobs_survive_reserve_drop() {
++        let resources = DeviceResources::new(
++            &SeccompAction::Allow,
++            &[Thread::VirtioBlock, Thread::VirtioNet],
++        )
++        .unwrap();
++        let reserved_id = resources.workers.lock().unwrap()[0]
++            .handle
++            .as_ref()
++            .unwrap()
++            .thread()
++            .id();
++        let (tx, rx) = mpsc::channel();
++        let handle = resources
++            .spawn(
++                "test-worker",
++                Thread::VirtioBlock,
++                &SeccompAction::Allow,
++                move || {
++                    tx.send(thread::current().id()).unwrap();
++                },
++            )
++            .unwrap();
++        drop(resources);
++        handle.join().unwrap();
++        assert_eq!(rx.recv().unwrap(), reserved_id);
++    }
++    #[test]
++    fn changed_environment_and_foreign_dispatch_do_not_consume_workers() {
++        let mut resources =
++            DeviceResources::new(&SeccompAction::Allow, &[Thread::VirtioBlock]).unwrap();
++        // Model a changed policy without changing the test runner's scheduler.
++        resources.environment.priority += 1;
++        resources
++            .spawn(
++                "fallback",
++                Thread::VirtioBlock,
++                &SeccompAction::Allow,
++                || {},
++            )
++            .unwrap()
++            .join()
++            .unwrap();
++        assert_eq!(resources.workers.lock().unwrap().len(), 1);
++        resources.environment.priority -= 1;
++        let resources = Arc::new(resources);
++        let foreign = resources.clone();
++        thread::spawn(move || {
++            foreign
++                .spawn("foreign", Thread::VirtioBlock, &SeccompAction::Allow, || {})
++                .unwrap()
++                .join()
++                .unwrap();
++        })
++        .join()
++        .unwrap();
++        assert_eq!(resources.workers.lock().unwrap().len(), 1);
++        resources
++            .spawn(
++                "wrong-kind",
++                Thread::VirtioNet,
++                &SeccompAction::Allow,
++                || {},
++            )
++            .unwrap()
++            .join()
++            .unwrap();
++        resources
++            .spawn(
++                "wrong-action",
++                Thread::VirtioBlock,
++                &SeccompAction::Trap,
++                || {},
++            )
++            .unwrap()
++            .join()
++            .unwrap();
++        assert_eq!(resources.workers.lock().unwrap().len(), 1);
++        resources
++            .spawn("match", Thread::VirtioBlock, &SeccompAction::Allow, || {})
++            .unwrap()
++            .join()
++            .unwrap();
++        assert!(resources.workers.lock().unwrap().is_empty());
++        assert!(
++            DeviceResources::new(&SeccompAction::Allow, &vec![Thread::VirtioBlock; 257]).is_err()
++        );
++    }
++}
+diff --git a/virtio-devices/src/rng.rs b/virtio-devices/src/rng.rs
+index b76557ed7..b2f66db0f 100644
+--- a/virtio-devices/src/rng.rs
++++ b/virtio-devices/src/rng.rs
+@@ -253,12 +253,14 @@ fn ack_features(&mut self, value: u64) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources,
+             mem,
+             interrupt_cb,
+             mut queues,
+             device_status,
+         } = context;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common
++            .activate(&queues, interrupt_cb.clone(), resources)?;
+         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+ 
+         if let Some(file) = self.random_file.as_ref() {
+diff --git a/virtio-devices/src/rtc.rs b/virtio-devices/src/rtc.rs
+index 540508e5e..378405bf8 100644
+--- a/virtio-devices/src/rtc.rs
++++ b/virtio-devices/src/rtc.rs
+@@ -623,12 +623,13 @@ fn ack_features(&mut self, value: u64) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources: _,
+             mem,
+             interrupt_cb,
+             mut queues,
+             device_status,
+         } = context;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common.activate(&queues, interrupt_cb.clone(), None)?;
+         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+ 
+         let (_, queue, queue_evt) = queues.remove(0);
+diff --git a/virtio-devices/src/thread_helper.rs b/virtio-devices/src/thread_helper.rs
+index 1cad99dd6..8f33c06d0 100644
+--- a/virtio-devices/src/thread_helper.rs
++++ b/virtio-devices/src/thread_helper.rs
+@@ -14,6 +14,7 @@
+ use vmm_sys_util::eventfd::EventFd;
+ 
+ use crate::epoll_helper::EpollHelperError;
++use crate::prepared::DeviceResources;
+ use crate::seccomp_filters::{Thread, get_cached_seccomp_filter};
+ use crate::{ActivateError, VirtioInterrupt, mark_device_needs_reset};
+ 
+@@ -23,6 +24,7 @@ pub(crate) fn spawn_virtio_thread<F>(
+     seccomp_action: &SeccompAction,
+     thread_type: Thread,
+     epoll_threads: &mut Vec<JoinHandle<()>>,
++    resources: Option<&DeviceResources>,
+     exit_evt: &EventFd,
+     device_status: Arc<AtomicU8>,
+     interrupt_cb: Arc<dyn VirtioInterrupt>,
+@@ -38,31 +40,35 @@ pub(crate) fn spawn_virtio_thread<F>(
+     let thread_exit_evt = exit_evt.try_clone().map_err(ActivateError::CloneEventFd)?;
+     let thread_name = name.to_string();
+ 
+-    thread::Builder::new()
+-        .name(name.to_string())
+-        .spawn(move || {
+-            if !seccomp_filter.is_empty()
+-                && let Err(e) = apply_filter(&seccomp_filter)
+-            {
+-                error!("Error applying seccomp filter: {e:?}");
++    let job = move || {
++        if !seccomp_filter.is_empty()
++            && let Err(e) = apply_filter(&seccomp_filter)
++        {
++            error!("Error applying seccomp filter: {e:?}");
++            thread_exit_evt.write(1).ok();
++            return;
++        }
++        match panic::catch_unwind(AssertUnwindSafe(f)) {
++            Err(_) => {
++                error!("{thread_name} thread panicked");
+                 thread_exit_evt.write(1).ok();
+-                return;
+             }
+-            match panic::catch_unwind(AssertUnwindSafe(f)) {
+-                Err(_) => {
+-                    error!("{thread_name} thread panicked");
+-                    thread_exit_evt.write(1).ok();
+-                }
+-                Ok(Err(e)) => {
+-                    mark_device_needs_reset(
+-                        &device_status,
+-                        interrupt_cb.as_ref(),
+-                        format_args!("{thread_name}: worker exited with error: {e:?}"),
+-                    );
+-                }
+-                Ok(Ok(())) => {}
++            Ok(Err(e)) => {
++                mark_device_needs_reset(
++                    &device_status,
++                    interrupt_cb.as_ref(),
++                    format_args!("{thread_name}: worker exited with error: {e:?}"),
++                );
+             }
+-        })
++            Ok(Ok(())) => {}
++        }
++    };
++    let result = if let Some(resources) = resources {
++        resources.spawn(name, thread_type, seccomp_action, job)
++    } else {
++        thread::Builder::new().name(name.to_string()).spawn(job)
++    };
++    result
+         .map(|thread| epoll_threads.push(thread))
+         .map_err(|e| {
+             error!("Failed to spawn thread for {name}: {e}");
+diff --git a/virtio-devices/src/transport/pci_device.rs b/virtio-devices/src/transport/pci_device.rs
+index bc66680fa..32d5f2563 100644
+--- a/virtio-devices/src/transport/pci_device.rs
++++ b/virtio-devices/src/transport/pci_device.rs
+@@ -37,6 +37,7 @@
+ use vmm_sys_util::eventfd::EventFd;
+ 
+ use super::pci_common_config::VirtioPciCommonConfigState;
++use crate::prepared::DeviceResources;
+ use crate::transport::{VIRTIO_PCI_COMMON_CONFIG_ID, VirtioPciCommonConfig, VirtioTransport};
+ use crate::{
+     ActivateResult, ActivationContext, DEVICE_ACKNOWLEDGE, DEVICE_DRIVER, DEVICE_DRIVER_OK,
+@@ -318,6 +319,7 @@ pub(super) struct VirtioPciDeviceState {
+ }
+ 
+ pub struct VirtioPciDeviceActivator {
++    resources: Option<Arc<DeviceResources>>,
+     interrupt: Arc<dyn VirtioInterrupt>,
+     memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+     device: Arc<Mutex<dyn VirtioDevice>>,
+@@ -331,6 +333,7 @@ pub struct VirtioPciDeviceActivator {
+ impl VirtioPciDeviceActivator {
+     pub fn activate(mut self) -> ActivateResult {
+         let result = self.device.lock().unwrap().activate(ActivationContext {
++            resources: self.resources.take(),
+             mem: self.memory.take().unwrap(),
+             interrupt_cb: self.interrupt.clone(),
+             queues: self.queues.take().unwrap(),
+@@ -418,6 +421,7 @@ pub struct VirtioPciDevice {
+ 
+     // Pending activations
+     pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
++    resources: Option<Arc<DeviceResources>>,
+ }
+ 
+ impl VirtioPciDevice {
+@@ -435,6 +439,7 @@ pub fn new(
+         dma_handler: Option<Arc<dyn ExternalDmaMapping>>,
+         pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
+         snapshot: Option<&Snapshot>,
++        resources: Option<Arc<DeviceResources>>,
+     ) -> Result<Self> {
+         let mut locked_device = device.lock().unwrap();
+         let mut queue_evts = Vec::new();
+@@ -639,6 +644,7 @@ pub fn new(
+             activate_evt,
+             dma_handler,
+             pending_activations,
++            resources,
+         };
+ 
+         // In case of a restore, we can activate the device, as we know at
+@@ -843,6 +849,7 @@ fn prepare_activator(&mut self, barrier: Option<Arc<Barrier>>) -> VirtioPciDevic
+         }
+ 
+         VirtioPciDeviceActivator {
++            resources: self.resources.take(),
+             interrupt: self.virtio_interrupt.clone(),
+             memory: Some(self.memory.clone()),
+             device: self.device.clone(),
+@@ -1595,6 +1602,7 @@ fn make_activator(
+         );
+         let barrier = Arc::new(Barrier::new(2));
+         let activator = VirtioPciDeviceActivator {
++            resources: None,
+             interrupt: interrupt.clone(),
+             memory: Some(memory),
+             device,
+@@ -1692,6 +1700,7 @@ fn make_virtio_pci_device() -> VirtioPciDevice {
+             None,
+             Arc::new(Mutex::new(Vec::new())),
+             None,
++            None,
+         )
+         .unwrap()
+     }
+@@ -1757,6 +1766,7 @@ fn make_virtio_pci_device_with_queues(num_queues: usize) -> VirtioPciDevice {
+             None,
+             Arc::new(Mutex::new(Vec::new())),
+             None,
++            None,
+         )
+         .unwrap()
+     }
+diff --git a/virtio-devices/src/vdpa.rs b/virtio-devices/src/vdpa.rs
+index f5d7ad7f2..cc5ff903c 100644
+--- a/virtio-devices/src/vdpa.rs
++++ b/virtio-devices/src/vdpa.rs
+@@ -435,6 +435,7 @@ fn write_config(&mut self, offset: u64, data: &[u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources: _,
+             mem,
+             interrupt_cb: virtio_interrupt,
+             queues,
+diff --git a/virtio-devices/src/vhost_user/blk.rs b/virtio-devices/src/vhost_user/blk.rs
+index 2da65687e..9f522c69c 100644
+--- a/virtio-devices/src/vhost_user/blk.rs
++++ b/virtio-devices/src/vhost_user/blk.rs
+@@ -298,6 +298,7 @@ fn write_config(&mut self, offset: u64, data: &[u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources: _,
+             mem,
+             interrupt_cb,
+             queues,
+@@ -305,7 +306,7 @@ fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         } = context;
+         self.vu_common
+             .virtio_common
+-            .activate(&queues, interrupt_cb.clone())?;
++            .activate(&queues, interrupt_cb.clone(), None)?;
+ 
+         let backend_req_handler = if self.vu_common.acked_protocol_features
+             & VhostUserProtocolFeatures::BACKEND_REQ.bits()
+diff --git a/virtio-devices/src/vhost_user/fs.rs b/virtio-devices/src/vhost_user/fs.rs
+index 9886ab939..ecc8dafbf 100644
+--- a/virtio-devices/src/vhost_user/fs.rs
++++ b/virtio-devices/src/vhost_user/fs.rs
+@@ -247,6 +247,7 @@ fn read_config(&self, offset: u64, data: &mut [u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources: _,
+             mem,
+             interrupt_cb,
+             queues,
+@@ -254,7 +255,7 @@ fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         } = context;
+         self.vu_common
+             .virtio_common
+-            .activate(&queues, interrupt_cb.clone())?;
++            .activate(&queues, interrupt_cb.clone(), None)?;
+ 
+         let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
+         // Run a dedicated thread for handling potential reconnections with
+diff --git a/virtio-devices/src/vhost_user/generic_vhost_user.rs b/virtio-devices/src/vhost_user/generic_vhost_user.rs
+index 8afd83fc2..df62040a2 100644
+--- a/virtio-devices/src/vhost_user/generic_vhost_user.rs
++++ b/virtio-devices/src/vhost_user/generic_vhost_user.rs
+@@ -284,6 +284,7 @@ fn write_config(&mut self, offset: u64, data: &[u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources: _,
+             mem,
+             interrupt_cb,
+             queues,
+@@ -291,7 +292,7 @@ fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         } = context;
+         self.vu_common
+             .virtio_common
+-            .activate(&queues, interrupt_cb.clone())?;
++            .activate(&queues, interrupt_cb.clone(), None)?;
+ 
+         let has_backend_req = self.vu_common.acked_protocol_features
+             & VhostUserProtocolFeatures::BACKEND_REQ.bits()
+diff --git a/virtio-devices/src/vhost_user/net.rs b/virtio-devices/src/vhost_user/net.rs
+index a07d78725..41862ea09 100644
+--- a/virtio-devices/src/vhost_user/net.rs
++++ b/virtio-devices/src/vhost_user/net.rs
+@@ -356,6 +356,7 @@ fn read_config(&self, offset: u64, data: &mut [u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources: _,
+             mem,
+             interrupt_cb,
+             mut queues,
+@@ -363,7 +364,7 @@ fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         } = context;
+         self.vu_common
+             .virtio_common
+-            .activate(&queues, interrupt_cb.clone())?;
++            .activate(&queues, interrupt_cb.clone(), None)?;
+ 
+         let num_queues = queues.len();
+         let event_idx = self
+diff --git a/virtio-devices/src/vsock/device.rs b/virtio-devices/src/vsock/device.rs
+index 14a2cd476..141e58eae 100644
+--- a/virtio-devices/src/vsock/device.rs
++++ b/virtio-devices/src/vsock/device.rs
+@@ -464,12 +464,14 @@ fn read_config(&self, offset: u64, data: &mut [u8]) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources,
+             mem,
+             interrupt_cb,
+             queues,
+             device_status,
+         } = context;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common
++            .activate(&queues, interrupt_cb.clone(), resources)?;
+         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+ 
+         let mut virtqueues = Vec::new();
+@@ -625,6 +627,7 @@ fn test_virtio_device() {
+ 
+         // Test a bad activation.
+         let bad_activate = ctx.device.activate(ActivationContext {
++            resources: None,
+             mem: memory.clone(),
+             interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
+             queues: Vec::new(),
+@@ -638,6 +641,7 @@ fn test_virtio_device() {
+         // Test a correct activation.
+         ctx.device
+             .activate(ActivationContext {
++                resources: None,
+                 mem: memory,
+                 interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
+                 queues: vec![
+diff --git a/virtio-devices/src/watchdog.rs b/virtio-devices/src/watchdog.rs
+index 01619f79d..962953831 100644
+--- a/virtio-devices/src/watchdog.rs
++++ b/virtio-devices/src/watchdog.rs
+@@ -332,12 +332,13 @@ fn ack_features(&mut self, value: u64) {
+ 
+     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+         let ActivationContext {
++            resources: _,
+             mem,
+             interrupt_cb,
+             mut queues,
+             device_status,
+         } = context;
+-        self.common.activate(&queues, interrupt_cb.clone())?;
++        self.common.activate(&queues, interrupt_cb.clone(), None)?;
+         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+ 
+         let reset_evt = self.reset_evt.try_clone().map_err(|e| {
+diff --git a/vmm/src/api/openapi/cloud-hypervisor.yaml b/vmm/src/api/openapi/cloud-hypervisor.yaml
+index 1d3da7159..f397c905b 100644
+--- a/vmm/src/api/openapi/cloud-hypervisor.yaml
++++ b/vmm/src/api/openapi/cloud-hypervisor.yaml
+@@ -29,9 +29,53 @@ paths:
+                   items:
+                     type: integer
+                     minimum: 0
++                block_queues:
++                  type: array
++                  maxItems: 32
++                  items:
++                    type: integer
++                    minimum: 1
++                    maximum: 64
++                net_queues:
++                  type: array
++                  maxItems: 32
++                  items:
++                    type: integer
++                    minimum: 2
++                    maximum: 64
++                    multipleOf: 2
++                console:
++                  type: boolean
++                  default: false
++                rng:
++                  type: boolean
++                  default: false
++                vsock:
++                  type: boolean
++                  default: false
++                balloon:
++                  type: boolean
++                  default: false
++                pmem:
++                  type: integer
++                  minimum: 0
++                  maximum: 32
++                  default: 0
+       responses:
+         '200':
+-          description: Empty default KVM VM prepared
++          description: KVM VM and bounded profile resources prepared
++          content:
++            application/json:
++              schema:
++                type: object
++                required: [vm, vcpus, workers]
++                properties:
++                  vm:
++                    type: boolean
++                  vcpus:
++                    type: integer
++                  workers:
++                    type: integer
+         '500':
+           description: Preparation failed
+ 
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index aaac90feb..f66ef34dc 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -96,6 +96,7 @@
+ use vfio_ioctls::VfioIommufd;
+ use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd, VfioOps};
+ use virtio_devices::block::Error as VirtioBlockError;
++use virtio_devices::prepared::DeviceResources;
+ use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator, VirtioTransport};
+ use virtio_devices::vhost_user::VhostUserConfig;
+ use virtio_devices::{
+@@ -914,6 +915,7 @@ fn translate_gva(&self, base: u64, size: u64) -> result::Result<u64, io::Error>
+ }
+ 
+ pub struct DeviceManager {
++    prepared_devices: Option<Arc<DeviceResources>>,
+     // Manage address space related to devices
+     address_manager: Arc<AddressManager>,
+ 
+@@ -1150,6 +1152,7 @@ pub fn new(
+         #[cfg(not(target_arch = "riscv64"))] timestamp: Instant,
+         snapshot: Option<&Snapshot>,
+         dynamic: bool,
++        prepared_devices: Option<Arc<DeviceResources>>,
+     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
+         trace_scoped!("DeviceManager::new");
+ 
+@@ -1371,6 +1374,7 @@ pub fn new(
+             #[cfg(not(target_arch = "riscv64"))]
+             timestamp,
+             pending_activations: Arc::new(Mutex::new(Vec::default())),
++            prepared_devices,
+             acpi_platform_addresses: AcpiPlatformAddresses::default(),
+             rate_limit_groups,
+             mmio_regions: Arc::new(Mutex::new(Vec::new())),
+@@ -4500,6 +4504,11 @@ fn add_virtio_pci_device(
+                 dma_handler,
+                 self.pending_activations.clone(),
+                 vm_migration::snapshot_from_id(snapshot, id.as_str()),
++                if is_hotplug {
++                    None
++                } else {
++                    self.prepared_devices.clone()
++                },
+             )
+             .map_err(DeviceManagerError::VirtioDevice)?,
+         ));
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 299474c3f..5123aa83b 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -36,6 +36,7 @@
+ use signal_hook::iterator::{Handle, Signals};
+ use thiserror::Error;
+ use tracer::trace_scoped;
++use virtio_devices::prepared::DeviceResources;
+ use virtio_devices::seccomp_filters::precompile_seccomp_filters;
+ use vm_memory::bitmap::AtomicBitmap;
+ use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
+@@ -711,7 +712,7 @@ pub struct Vmm {
+     vm_config: Option<Arc<Mutex<VmConfig>>>,
+     seccomp_action: SeccompAction,
+     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+-    precreated_vm: Option<Arc<dyn hypervisor::Vm>>,
++    precreated_vm: Option<prewarm::PreparedVm>,
+     prepared_vcpu_ids: Vec<u32>,
+     activate_evt: EventFd,
+     signals: Option<Handle>,
+@@ -1448,6 +1449,7 @@ fn vm_receive_state<T>(
+                 Some(&snapshot),
+                 #[cfg(feature = "igvm")]
+                 None,
++                None,
+             )
+             .map_err(|e| {
+                 MigratableError::MigrateReceive(anyhow!("Error creating VM from snapshot: {e:?}"))
+@@ -2844,11 +2846,21 @@ fn vmm_prepare(&mut self, config: prewarm::PrepareConfig) -> result::Result<Vec<
+             vm.prepare_vcpus(&config.vcpu_ids)
+                 .map_err(VmError::Prepare)?;
+         }
++        let kinds = config.worker_kinds().map_err(VmError::Prepare)?;
++        let devices = if kinds.is_empty() {
++            None
++        } else {
++            Some(Arc::new(
++                DeviceResources::new(&self.seccomp_action, &kinds)
++                    .map_err(|error| VmError::Prepare(error.into()))?,
++            ))
++        };
+         self.prepared_vcpu_ids = config.vcpu_ids.clone();
+-        self.precreated_vm = Some(vm);
++        self.precreated_vm = Some(prewarm::PreparedVm { vm, devices });
+         serde_json::to_vec(&prewarm::PrepareResponse {
+             vm: true,
+             vcpus: config.vcpu_ids.len(),
++            workers: kinds.len(),
+         })
+         .map_err(|error| VmError::Prepare(error.into()))
+     }
+diff --git a/vmm/src/prewarm.rs b/vmm/src/prewarm.rs
+index 57308f04e..3ea6d6d03 100644
+--- a/vmm/src/prewarm.rs
++++ b/vmm/src/prewarm.rs
+@@ -1,7 +1,12 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //! Optional resources owned by an idle VMM and consumed by one restore.
+ 
++use std::iter::repeat_n;
++use std::sync::Arc;
++
+ use serde::{Deserialize, Serialize};
++use virtio_devices::prepared::DeviceResources;
++use virtio_devices::seccomp_filters::Thread;
+ 
+ use crate::vm_config::CpusConfig;
+ 
+@@ -60,6 +65,20 @@ fn ordinary_cpu_policy_does_not_change_kvm_vm_type() {
+ pub struct PrepareConfig {
+     #[serde(default)]
+     pub vcpu_ids: Vec<u32>,
++    #[serde(default)]
++    pub block_queues: Vec<u16>,
++    #[serde(default)]
++    pub net_queues: Vec<u16>,
++    #[serde(default)]
++    pub console: bool,
++    #[serde(default)]
++    pub rng: bool,
++    #[serde(default)]
++    pub pmem: u16,
++    #[serde(default)]
++    pub vsock: bool,
++    #[serde(default)]
++    pub balloon: bool,
+ }
+ 
+ impl PrepareConfig {
+@@ -73,14 +92,73 @@ pub fn validate(&self) -> anyhow::Result<()> {
+         {
+             anyhow::bail!("VCPU IDs must be consecutive from zero and bounded by 256");
+         }
++        self.queue_count()?;
++        self.worker_kinds()?;
+         Ok(())
+     }
++
++    pub fn worker_kinds(&self) -> anyhow::Result<Vec<Thread>> {
++        self.queue_count()?;
++        let mut kinds = Vec::new();
++        for &count in &self.block_queues {
++            kinds.extend(repeat_n(Thread::VirtioBlock, count as usize));
++        }
++        for &count in &self.net_queues {
++            kinds.extend(repeat_n(Thread::VirtioNet, count as usize / 2));
++            kinds.push(Thread::VirtioNetCtl);
++        }
++        kinds.extend(repeat_n(Thread::VirtioPmem, self.pmem as usize));
++        for (enabled, kind) in [
++            (self.console, Thread::VirtioConsole),
++            (self.rng, Thread::VirtioRng),
++            (self.vsock, Thread::VirtioVsock),
++            (self.balloon, Thread::VirtioBalloon),
++        ] {
++            if enabled {
++                kinds.push(kind);
++            }
++        }
++        if kinds.len() > 256 {
++            anyhow::bail!("Worker reserve exceeds limit");
++        }
++        Ok(kinds)
++    }
++
++    pub fn queue_count(&self) -> anyhow::Result<usize> {
++        if self.block_queues.len() > 32
++            || self.net_queues.len() > 32
++            || self.pmem > 32
++            || self.block_queues.iter().any(|&q| q == 0 || q > 64)
++            || self
++                .net_queues
++                .iter()
++                .any(|&q| q == 0 || q > 64 || q % 2 != 0)
++        {
++            anyhow::bail!("Invalid device queue profile");
++        }
++        let count = self.block_queues.iter().map(|&q| q as usize).sum::<usize>()
++            + self
++                .net_queues
++                .iter()
++                .map(|&q| q as usize + 1)
++                .sum::<usize>()
++            + usize::from(self.console) * 2
++            + usize::from(self.rng)
++            + self.pmem as usize
++            + usize::from(self.vsock) * 3
++            + usize::from(self.balloon) * 4;
++        if count > 4096 {
++            anyhow::bail!("Event descriptor reserve exceeds limit");
++        }
++        Ok(count)
++    }
+ }
+ 
+ #[derive(Serialize)]
+ pub struct PrepareResponse {
+     pub vm: bool,
+     pub vcpus: usize,
++    pub workers: usize,
+ }
+ 
+ /// Preparation is limited to the KVM architectures with descriptor support.
+@@ -133,14 +211,59 @@ pub fn validate_vcpu_ids(ids: &[u32], config: &CpusConfig) -> anyhow::Result<()>
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[test]
++    fn device_profile_is_bounded_and_counts_network_pairs() {
++        let config = PrepareConfig {
++            block_queues: vec![2],
++            net_queues: vec![4],
++            console: true,
++            rng: true,
++            ..Default::default()
++        };
++        assert_eq!(
++            config.worker_kinds().unwrap(),
++            vec![
++                Thread::VirtioBlock,
++                Thread::VirtioBlock,
++                Thread::VirtioNet,
++                Thread::VirtioNet,
++                Thread::VirtioNetCtl,
++                Thread::VirtioConsole,
++                Thread::VirtioRng
++            ]
++        );
++        for config in [
++            PrepareConfig {
++                net_queues: vec![3],
++                ..Default::default()
++            },
++            PrepareConfig {
++                block_queues: vec![0],
++                ..Default::default()
++            },
++            PrepareConfig {
++                block_queues: vec![64; 5],
++                ..Default::default()
++            },
++        ] {
++            assert!(config.validate().is_err());
++        }
++    }
++
+     #[test]
+     fn reject_invalid_cpu_profile_before_preparing_resources() {
+         for ids in [vec![1], vec![0, 0], vec![0, 2], (0..257).collect()] {
+-            PrepareConfig { vcpu_ids: ids }.validate().unwrap_err();
++            PrepareConfig {
++                vcpu_ids: ids,
++                ..Default::default()
++            }
++            .validate()
++            .unwrap_err();
+         }
+         PrepareConfig::default().validate().unwrap();
+         PrepareConfig {
+             vcpu_ids: vec![0, 1],
++            ..Default::default()
+         }
+         .validate()
+         .unwrap();
+@@ -179,3 +302,9 @@ fn reject_extra_reserved_vcpus_and_topology_mismatch() {
+         }
+     }
+ }
++
++/// Restore owns the VM and all remaining device reservations together.
++pub struct PreparedVm {
++    pub vm: Arc<dyn hypervisor::Vm>,
++    pub devices: Option<Arc<DeviceResources>>,
++}
+diff --git a/vmm/src/seccomp_filters.rs b/vmm/src/seccomp_filters.rs
+index e2f8e70fd..f532c9437 100644
+--- a/vmm/src/seccomp_filters.rs
++++ b/vmm/src/seccomp_filters.rs
+@@ -750,6 +750,8 @@ fn vmm_thread_rules(
+         (libc::SYS_rseq, vec![]),
+         (libc::SYS_rt_sigreturn, vec![]),
+         (libc::SYS_sched_getaffinity, vec![]),
++        (libc::SYS_sched_getscheduler, vec![]),
++        (libc::SYS_sched_getparam, vec![]),
+         (libc::SYS_sched_setaffinity, vec![]),
+         (libc::SYS_sched_yield, vec![]),
+         (libc::SYS_seccomp, vec![]),
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index 261c311b6..ceb997e43 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -74,6 +74,7 @@
+ use serde::{Deserialize, Serialize};
+ use thiserror::Error;
+ use tracer::trace_scoped;
++use virtio_devices::prepared::DeviceResources;
+ use vm_device::Bus;
+ #[cfg(feature = "tdx")]
+ use vm_memory::GuestMemoryBackend;
+@@ -108,7 +109,7 @@
+ #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+ use crate::migration::url_to_file;
+ use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapshot, url_to_path};
+-use crate::prewarm::compatible_vm_type;
++use crate::prewarm::{PreparedVm, compatible_vm_type};
+ #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+ use crate::sev::MeasuredBootInfo;
+ #[cfg(feature = "fw_cfg")]
+@@ -599,6 +600,7 @@ pub fn new_from_memory_manager(
+         original_termios: Arc<Mutex<Option<termios>>>,
+         snapshot: Option<&Snapshot>,
+         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
++        prepared_devices: Option<Arc<DeviceResources>>,
+     ) -> Result<Self> {
+         trace_scoped!("Vm::new_from_memory_manager");
+ 
+@@ -668,6 +670,7 @@ pub fn new_from_memory_manager(
+             #[cfg(not(target_arch = "riscv64"))]
+             timestamp,
+             snapshot,
++            prepared_devices,
+         )?;
+ 
+         // Perform hypervisor-specific initialization
+@@ -860,6 +863,7 @@ fn create_device_manager(
+         boot_id_list: BTreeSet<String>,
+         #[cfg(not(target_arch = "riscv64"))] timestamp: Instant,
+         snapshot: Option<&Snapshot>,
++        prepared_devices: Option<Arc<DeviceResources>>,
+     ) -> Result<Arc<Mutex<DeviceManager>>> {
+         #[cfg(feature = "tdx")]
+         let dynamic = !config.lock().unwrap().is_tdx_enabled();
+@@ -885,6 +889,7 @@ fn create_device_manager(
+             timestamp,
+             snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID),
+             dynamic,
++            prepared_devices,
+         )
+         .map_err(Error::DeviceManager)
+     }
+@@ -1356,7 +1361,7 @@ pub fn new(
+         source_url: Option<&str>,
+         prefault: Option<bool>,
+         memory_restore_mode: Option<MemoryRestoreMode>,
+-        precreated_vm: Option<Arc<dyn hypervisor::Vm>>,
++        prepared_vm: Option<PreparedVm>,
+     ) -> Result<Self> {
+         trace_scoped!("Vm::new");
+ 
+@@ -1382,6 +1387,7 @@ pub fn new(
+                 .map_err(Error::IgvmLoad)?
+         };
+ 
++        let mut prepared_devices = None;
+         let vm = {
+             #[allow(unused_mut)]
+             let mut hv_config: hypervisor::HypervisorVmConfig =
+@@ -1390,12 +1396,21 @@ pub fn new(
+             if let Some(ref igvm) = igvm_file {
+                 hv_config.vmsa_features = igvm_loader::extract_sev_features(igvm);
+             }
+-            match precreated_vm {
+-                Some(vm) if compatible_vm_type(&hv_config) => vm,
++            match prepared_vm {
++                Some(prepared) if compatible_vm_type(&hv_config) => {
++                    prepared_devices = prepared.devices;
++                    prepared.vm
++                }
+                 _ => Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?,
+             }
+         };
+ 
++        // A later Landlock transition must apply to newly activated workers.
++        // Parked threads cannot inherit a restriction added after creation.
++        if vm_config.lock().unwrap().landlock_enable {
++            prepared_devices = None;
++        }
++
+         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+         if vm_config.lock().unwrap().max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
+             vm.enable_x2apic_api().unwrap();
+@@ -1463,6 +1478,7 @@ pub fn new(
+             snapshot,
+             #[cfg(feature = "igvm")]
+             igvm_file,
++            prepared_devices,
+         )
+     }
+ 
