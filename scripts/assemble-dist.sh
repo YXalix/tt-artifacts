@@ -20,13 +20,22 @@ esac
 
 artifacts=(vmlinux rootfs.erofs base.erofs cloud-hypervisor envd sandbox-init flatten-ctl mkfs.erofs fsck.erofs dump.erofs)
 
-for f in "${artifacts[@]}"; do
-    if [ -f "$BIN_DIR/$f" ]; then
-        install -m 0644 "$BIN_DIR/$f" "$DIST_DIR/$f"
-    elif [ -f "$DIST_DIR/$f" ]; then
+# Host/guest executables keep their exec bits in dist (consumers run them
+# directly, e.g. CLOUD_HYPERVISOR_BIN); kernel and filesystem images are 0644.
+exec_artifacts=(cloud-hypervisor envd sandbox-init flatten-ctl mkfs.erofs fsck.erofs dump.erofs)
+image_artifacts=(vmlinux rootfs.erofs base.erofs)
+
+for f in "${exec_artifacts[@]}"; do
+    [ -f "$BIN_DIR/$f" ] || die "missing artifact: bin/$TARGET_ARCH/$f (run the matching build target first)"
+    install -m 0755 "$BIN_DIR/$f" "$DIST_DIR/$f"
+done
+for f in "${image_artifacts[@]}"; do
+    if [ -f "$DIST_DIR/$f" ]; then
         : # image produced in place by build-rootfs/build-base-image
+    elif [ -f "$BIN_DIR/$f" ]; then
+        install -m 0644 "$BIN_DIR/$f" "$DIST_DIR/$f"
     else
-        die "missing artifact for dist: $f (bin/$TARGET_ARCH/$f not built)"
+        die "missing artifact for dist: $f"
     fi
 done
 
