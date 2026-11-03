@@ -28,9 +28,10 @@ tarball="$(resolve_tarball "$EROFS_UTILS_TARBALL" "$EROFS_UTILS_TARBALL_SHA256")
 src_dir="$BUILD_DIR/src/erofs-utils"
 extract_tarball "$tarball" "$src_dir"
 
-# Autoconf sources ship in the repo; generate configure once.
+# The GitHub source archive has no generated configure; autoreconf needs
+# libtoolize (the libtool package's guaranteed binary, unlike libtool itself).
 if [ ! -x "$src_dir/configure" ]; then
-    require_cmd autoreconf automake autoconf libtool
+    require_cmd autoreconf automake autoconf libtoolize
     (cd "$src_dir" && ./autogen.sh)
 fi
 
