@@ -56,8 +56,22 @@ log "mkfs.erofs: bare, uncompressed, no inline data"
 mkdir -p "$DIST_DIR"
 rm -f "$out"
 # No -z option: erofs-utils 1.9.x has no "none" compressor; without -z the
-# image is plain uncompressed EROFS.
-"$mkfs_bin" -E noinline_data "$out" "$staging"
+# image is plain uncompressed EROFS. The staging tree keeps upstream modes
+# such as snapd's mode-0000 void directory; if this user cannot read those,
+# retry under sudo and hand the image back.
+mkfs_err="$BUILD_DIR/base/$TARGET_ARCH/mkfs.err"
+cur_uid="$(id -u)"; cur_gid="$(id -g)"
+if ! "$mkfs_bin" -E noinline_data "$out" "$staging" 2>"$mkfs_err"; then
+    if grep -q "Permission denied" "$mkfs_err" && command -v sudo >/dev/null 2>&1; then
+        log "staging tree unreadable for this user; retrying mkfs with sudo"
+        rm -f "$out"
+        sudo "$mkfs_bin" -E noinline_data "$out" "$staging"
+        sudo chown "$cur_uid:$cur_gid" "$out"
+    else
+        cat "$mkfs_err" >&2
+        die "mkfs.erofs failed for $out"
+    fi
+fi
 
 if [ -x "$fsck_bin" ]; then
     "$fsck_bin" "$out" >/dev/null 2>&1 || die "fsck.erofs failed on $out"

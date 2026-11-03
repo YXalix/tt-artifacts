@@ -45,6 +45,8 @@ dist/<arch>/
 
 常用环境变量：`BUILD_JOBS`（并行度，默认 nproc）、`TARGET_ARCH`、`TARBALL_CACHE`（tarball 共享缓存）、`TT_ARTIFACTS_BUILD_DIR`（构建工作区位置）、`MKFS_EROFS`/`FSCK_EROFS`（镜像工具路径覆盖）。网络受限时可为 Go 构建设置 `GOPROXY=https://goproxy.cn,direct`。
 
+非 root 用户也可以构建：base 镜像里的 `/dev/*` 设备节点（mknod）和 0000 权限目录（如 snapd `void`）需要特权，脚本会自动用 sudo 重试该步，再把产物属主交还；无 sudo 时请用 root 运行对应目标。
+
 ## GitHub Actions
 
 - `build.yml`：push 到 main / PR / 手动触发。矩阵覆盖 x86_64（`ubuntu-24.04`）和 aarch64（`ubuntu-24.04-arm`，公开仓库免费原生 runner），产出 `tt-artifacts-<arch>` artifact。
