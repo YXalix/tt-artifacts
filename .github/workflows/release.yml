@@ -22,19 +22,33 @@ jobs:
           pattern: tt-artifacts-*
           merge-multiple: false
 
-      - name: Package release archives
+      - name: Package release assets
         run: |
           set -euxo pipefail
           tag="${GITHUB_REF_NAME}"
           mkdir -p release-out
+          # Full per-arch archive plus every artifact as an individual asset
+          # ("<name>-<arch>"), each covered by SHA256SUMS-<arch>.txt so a
+          # single-file download can be verified on its own. The per-arch
+          # SHA256SUMS stays inside the archive.
           for d in tt-artifacts-*/; do
             arch="${d#tt-artifacts-}"; arch="${arch%/}"
             tar -czf "release-out/tt-artifacts-${arch}-${tag}.tar.gz" "${d%/}"
+            (
+              cd "${d%/}" && sha256sum --check SHA256SUMS >/dev/null
+            )
+            sums="release-out/SHA256SUMS-${arch}.txt"
+            : > "$sums"
+            for f in "${d%/}"/*; do
+              name="$(basename "$f")"
+              if [ "$name" = "SHA256SUMS" ]; then continue; fi
+              asset="${name}-${arch}"
+              cp "$f" "release-out/${asset}"
+              printf '%s  %s\n' \
+                "$(sha256sum "release-out/${asset}" | cut -d' ' -f1)" \
+                "${asset}" >> "$sums"
+            done
           done
-          (
-            cd tt-artifacts-x86_64  && sha256sum --check SHA256SUMS >/dev/null
-            cd ../tt-artifacts-aarch64 && sha256sum --check SHA256SUMS >/dev/null
-          )
           sha256sum release-out/*.tar.gz > release-out/SHA256SUMS
 
       - name: Create GitHub release

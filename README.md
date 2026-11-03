@@ -50,7 +50,10 @@ dist/<arch>/
 ## GitHub Actions
 
 - `build.yml`：push 到 main / PR / 手动触发。矩阵覆盖 x86_64（`ubuntu-24.04`）和 aarch64（`ubuntu-24.04-arm`，公开仓库免费原生 runner），产出 `tt-artifacts-<arch>` artifact。
-- `release.yml`：推送 `v*` tag 时调用 build 工作流，将两个架构的产物打包为 `tt-artifacts-<arch>-<tag>.tar.gz` 并附 `SHA256SUMS` 发布到 GitHub Release。
+- `release.yml`：推送 `v*` tag 时调用 build 工作流，发布到 GitHub Release。资产包含：
+  - `tt-artifacts-<arch>-<tag>.tar.gz`：单架构完整包（内含该架构的 `SHA256SUMS`）；
+  - `<name>-<arch>`：每个产物一个独立文件（如 `vmlinux-x86_64`、`rootfs.erofs-aarch64`），只想要单个产物时按需下载；
+  - `SHA256SUMS`：两个完整包的校验和；`SHA256SUMS-<arch>.txt`：独立文件的校验和（文件名即资产名，可直接 `sha256sum -c`）。
 
 ## 接入 tfc-server 验证
 
